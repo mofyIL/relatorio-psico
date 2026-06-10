@@ -364,7 +364,19 @@ st.title("📊 Gerador de Relatórios Psicossocial")
 
 st.markdown("---")
 
-# Interface principal
+# Inicializacao
+auto_loaded = False
+df_raw = None
+
+if "gcp_service_account" in st.secrets and "google_forms" in st.secrets:
+    with st.spinner("🔄 Conectando ao Google Forms automaticamente..."):
+        df_raw, err = load_from_gsheets_auto()
+        if df_raw is not None:
+            auto_loaded = True
+            st.success(f"✅ Conectado! {len(df_raw)} respostas encontradas.")
+        else:
+            st.warning(f"⚠️ Conexão automática falhou: {err}. Use o modo manual abaixo.")
+
 if not auto_loaded:
     modo = st.radio("Como você quer importar os dados?", ["📤 Upload de CSV (manual)", "🌐 Google Forms (manual)"])
 
