@@ -324,7 +324,8 @@ def load_from_gsheets_auto():
         ).execute()
         values = result.get("values", [])
         if not values: return None, "Planilha vazia!"
-        df = pd.DataFrame(values[1:], columns=values[0])
+        max_cols = len(values[0])
+        df = pd.DataFrame([r + [""] * (max_cols - len(r)) for r in values[1:]], columns=values[0])
         df.columns = [norm_text(c) for c in df.columns]
         return df, None
     except Exception as e:
@@ -348,7 +349,8 @@ def load_from_gsheets_manual(credentials_file, spreadsheet_id):
         ).execute()
         values = result.get("values", [])
         if not values: return None, "Planilha vazia!"
-        df = pd.DataFrame(values[1:], columns=values[0])
+        max_cols = len(values[0])
+        df = pd.DataFrame([r + [""] * (max_cols - len(r)) for r in values[1:]], columns=values[0])
         df.columns = [norm_text(c) for c in df.columns]
         return df, None
     except Exception as e:
