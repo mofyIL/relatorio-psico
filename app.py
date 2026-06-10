@@ -431,8 +431,6 @@ if df_raw is not None:
                 st.error(f"❌ Erro ao gerar relatório: {e}")
 
 st.markdown("---")
-st.markdown("### 📋 Instruções para configurar Google Forms (opcional):")
-st.markdown("""
 1. Crie projeto no Google Cloud Console (console.cloud.google.com)
 2. Active APIs: Google Sheets API, Google Forms API
 3. Crie Service Account e baixe credentials.json
