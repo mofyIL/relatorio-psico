@@ -361,21 +361,10 @@ def load_from_gsheets_manual(credentials_file, spreadsheet_id):
 # ========================
 
 st.title("📊 Gerador de Relatórios Psicossocial")
+
 st.markdown("---")
 
-# Tenta carregar automaticamente dos Secrets
-auto_loaded = False
-df_raw = None
-
-if "gcp_service_account" in st.secrets and "google_forms" in st.secrets:
-    with st.spinner("🔄 Conectando ao Google Forms automaticamente..."):
-        df_raw, err = load_from_gsheets_auto()
-        if df_raw is not None:
-            auto_loaded = True
-            st.success(f"✅ Google Forms conectado automaticamente! {len(df_raw)} respostas encontradas.")
-        else:
-            st.warning(f"⚠️ Conexão automática falhou: {err}. Use o modo manual abaixo.")
-
+# Interface principal
 if not auto_loaded:
     modo = st.radio("Como você quer importar os dados?", ["📤 Upload de CSV (manual)", "🌐 Google Forms (manual)"])
 
@@ -399,7 +388,6 @@ if not auto_loaded:
 
 if df_raw is not None:
     df_scored = prepare_scored_df(df_raw)
-    st.markdown("---")
     st.subheader("📋 Selecionar empresa e setor")
     empresas = sorted({norm_text(str(x)) for x in df_raw['NOME DA EMPRESA'].dropna()})
     empresa_selected = st.selectbox("Selecione a empresa:", empresas)
@@ -429,10 +417,3 @@ if df_raw is not None:
                         )
             except Exception as e:
                 st.error(f"❌ Erro ao gerar relatório: {e}")
-
-st.markdown("---")
-1. Crie projeto no Google Cloud Console (console.cloud.google.com)
-2. Active APIs: Google Sheets API, Google Forms API
-3. Crie Service Account e baixe credentials.json
-4. Compartilhe a spreadsheet do Google Forms com o email do Service Account
-""")
