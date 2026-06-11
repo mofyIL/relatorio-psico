@@ -212,7 +212,7 @@ def get_app_setting(name: str, default: Any) -> Any:
 # GOOGLE SHEETS / DRIVE
 # =============================================================================
 
-@st.cache_resource
+@st.cache_resource(scope="session")
 def google_services():
     if "gcp_service_account" not in st.secrets:
         raise RuntimeError("As credenciais gcp_service_account não estão configuradas nos Secrets.")
