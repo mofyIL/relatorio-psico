@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
+import ssl
+import time
+import unicodedata
 import secrets as secure_secrets
 import zipfile
 from datetime import date, datetime, timedelta
 from io import BytesIO
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import qrcode
 import streamlit as st
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from reporting import ReportConfig, generate_company_reports, normalize_dataframe_columns, normalize_text
@@ -212,6 +218,42 @@ def get_app_setting(name: str, default: Any) -> Any:
 # GOOGLE SHEETS / DRIVE
 # =============================================================================
 
+RETRYABLE_HTTP_STATUS = {408, 429, 500, 502, 503, 504}
+
+
+def execute_google_read(
+    request_factory,
+    operation: str,
+    max_attempts: int = 4,
+):
+    # Executa leitura idempotente do Google com espera exponencial.
+    last_error: Exception | None = None
+
+    for attempt in range(max_attempts):
+        try:
+            request = request_factory()
+            return request.execute(num_retries=2)
+        except HttpError as exc:
+            status = int(getattr(exc.resp, "status", 0) or 0)
+            if status not in RETRYABLE_HTTP_STATUS:
+                raise
+            last_error = exc
+        except (ssl.SSLError, TimeoutError, ConnectionError, OSError) as exc:
+            last_error = exc
+
+        if attempt >= max_attempts - 1:
+            break
+
+        delay = min(8.0, (2**attempt) + random.uniform(0.0, 1.0))
+        time.sleep(delay)
+
+    raise RuntimeError(
+        f"Falha temporária ao {operation} após {max_attempts} tentativas. "
+        "Tente novamente em alguns instantes."
+    ) from last_error
+
+
+
 def google_services():
     if "gcp_service_account" not in st.secrets:
         raise RuntimeError("As credenciais gcp_service_account não estão configuradas nos Secrets.")
@@ -235,31 +277,47 @@ def spreadsheet_id() -> str:
 
 
 def read_sheet(sheet_name: str) -> pd.DataFrame:
-    sheets, _ = google_services()
-    result = sheets.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id(),
-        range=f"'{sheet_name}'",
-    ).execute()
+    result = execute_google_read(
+        lambda: google_services()[0]
+        .spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id(),
+            range=f"'{sheet_name}'",
+        ),
+        operation=f"ler a aba {sheet_name}",
+    )
+
     values = result.get("values", [])
+
     if not values:
         return pd.DataFrame()
+
     headers = [str(value).strip() for value in values[0]]
     width = len(headers)
     rows = []
+
     for row_number, row in enumerate(values[1:], start=2):
         padded = list(row) + [""] * (width - len(row))
         record = dict(zip(headers, padded[:width]))
         record["__ROW__"] = row_number
         rows.append(record)
+
     return pd.DataFrame(rows)
 
 
 def get_sheet_headers(sheet_name: str) -> list[str]:
-    sheets, _ = google_services()
-    result = sheets.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id(),
-        range=f"'{sheet_name}'!1:1",
-    ).execute()
+    result = execute_google_read(
+        lambda: google_services()[0]
+        .spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id(),
+            range=f"'{sheet_name}'!1:1",
+        ),
+        operation=f"ler o cabeçalho da aba {sheet_name}",
+    )
+
     values = result.get("values", [])
     return [str(value).strip() for value in values[0]] if values else []
 
@@ -463,23 +521,174 @@ def cycle_expired(cycle: pd.Series) -> bool:
     return bool(valid_until and now_sp().date() > valid_until)
 
 
+
+def emv_field(field_id: str, value: str) -> str:
+    encoded = str(value)
+    if len(encoded) > 99:
+        raise ValueError(f"Campo EMV {field_id} excede 99 caracteres.")
+    return f"{field_id}{len(encoded):02d}{encoded}"
+
+
+def pix_text(value: Any, max_length: int) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value))
+    ascii_text = normalized.encode("ASCII", "ignore").decode("ASCII")
+    allowed = "".join(
+        char
+        for char in ascii_text.upper()
+        if char.isalnum() or char in {" ", "-", ".", "/"}
+    )
+    return " ".join(allowed.split())[:max_length]
+
+
+def pix_txid(value: Any) -> str:
+    clean = "".join(char for char in pix_text(value, 80) if char.isalnum())
+    return clean[:25] or "***"
+
+
+def pix_crc16(payload: str) -> str:
+    crc = 0xFFFF
+
+    for byte in payload.encode("utf-8"):
+        crc ^= byte << 8
+
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+
+    return f"{crc:04X}"
+
+
+def build_pix_payload(
+    key: str,
+    receiver_name: str,
+    receiver_city: str,
+    amount: float,
+    txid: str,
+    description: str = "",
+) -> str:
+    if not key.strip():
+        raise ValueError("A chave Pix não foi configurada.")
+
+    merchant_account = (
+        emv_field("00", "BR.GOV.BCB.PIX")
+        + emv_field("01", key.strip())
+    )
+
+    clean_description = pix_text(description, 40)
+    if clean_description:
+        merchant_account += emv_field("02", clean_description)
+
+    additional_data = emv_field("05", pix_txid(txid))
+
+    payload = (
+        emv_field("00", "01")
+        + emv_field("26", merchant_account)
+        + emv_field("52", "0000")
+        + emv_field("53", "986")
+        + emv_field("54", f"{amount:.2f}")
+        + emv_field("58", "BR")
+        + emv_field("59", pix_text(receiver_name, 25))
+        + emv_field("60", pix_text(receiver_city, 15))
+        + emv_field("62", additional_data)
+        + "6304"
+    )
+
+    return payload + pix_crc16(payload)
+
+
+def pix_qr_png(payload: str) -> bytes:
+    image = qrcode.make(payload)
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def render_pix_payment(
+    company: pd.Series,
+    cycle: pd.Series,
+    amount: float,
+) -> None:
+    if amount <= 0 or is_yes(cycle.get("PAGAMENTO_OK", "")):
+        return
+
+    pix_cfg = st.secrets.get("pix", {})
+    key = str(pix_cfg.get("key", "")).strip()
+    receiver_name = str(pix_cfg.get("receiver_name", "")).strip()
+    receiver_city = str(pix_cfg.get("receiver_city", "")).strip()
+    description = str(
+        pix_cfg.get("description", "MAPEAMENTO PSICOSSOCIAL")
+    ).strip()
+    contact = str(pix_cfg.get("payment_contact", "")).strip()
+
+    if not key or not receiver_name or not receiver_city:
+        return
+
+    payload = build_pix_payload(
+        key=key,
+        receiver_name=receiver_name,
+        receiver_city=receiver_city,
+        amount=amount,
+        txid=str(cycle.get("CICLO_ID", "")),
+        description=description,
+    )
+
+    with st.expander("💠 Pagamento via Pix", expanded=False):
+        st.write(f"**Valor:** {brl(amount)}")
+        st.image(
+            pix_qr_png(payload),
+            width=260,
+            caption="Escaneie no aplicativo do seu banco.",
+        )
+        st.markdown("**Pix Copia e Cola**")
+        st.code(payload, language=None)
+
+        if contact:
+            st.caption(
+                f"Após o pagamento, envie o comprovante para {contact}. "
+                "A liberação será confirmada pelo administrador."
+            )
+        else:
+            st.caption(
+                "Após o pagamento, envie o comprovante ao responsável comercial. "
+                "A liberação será confirmada pelo administrador."
+            )
+
+
 def build_form_link(company: pd.Series, cycle: pd.Series) -> str:
     forms_cfg = st.secrets.get("google_forms", {})
     base_url = str(forms_cfg.get("base_url", "")).strip()
+
     if not base_url:
         return ""
-    params: dict[str, str] = {"usp": "pp_url"}
+
+    parts = urlsplit(base_url)
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    params["usp"] = "pp_url"
+
     entry_company = str(forms_cfg.get("entry_company", "327839909")).strip()
     entry_company_id = str(forms_cfg.get("entry_company_id", "")).strip()
     entry_cycle_id = str(forms_cfg.get("entry_cycle_id", "")).strip()
+
     if entry_company:
         params[f"entry.{entry_company}"] = str(company.get("NOME", ""))
+
     if entry_company_id:
         params[f"entry.{entry_company_id}"] = str(company.get("EMPRESA_ID", ""))
+
     if entry_cycle_id:
         params[f"entry.{entry_cycle_id}"] = str(cycle.get("CICLO_ID", ""))
-    separator = "&" if "?" in base_url else "?"
-    return base_url + separator + urlencode(params)
+
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            urlencode(params),
+            parts.fragment,
+        )
+    )
 
 
 def build_client_link(token: str) -> str:
@@ -608,6 +817,24 @@ def render_client() -> None:
 
     if unit_price > 0:
         st.caption(f"Valor contratado: {brl(contract_value)} ({contracted} funcionário(s) × {brl(unit_price)}; mínimo considerado quando configurado).")
+
+    refresh_col, updated_col = st.columns([1, 3])
+
+    with refresh_col:
+        if st.button(
+            "🔄 Atualizar respostas",
+            use_container_width=True,
+            key=f"refresh_{cycle.get('CICLO_ID', '')}",
+        ):
+            st.toast("Contagem atualizada com sucesso.")
+
+    with updated_col:
+        st.caption(
+            f"Dados consultados em {now_sp().strftime('%d/%m/%Y às %H:%M:%S')}."
+        )
+
+    render_pix_payment(company, cycle, contract_value)
+
     if over_limit:
         st.error(
             f"Há {response_count - contracted} resposta(s) acima do contratado. A geração permanece bloqueada até o ajuste comercial pelo administrador."
