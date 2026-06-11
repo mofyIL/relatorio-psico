@@ -212,7 +212,6 @@ def get_app_setting(name: str, default: Any) -> Any:
 # GOOGLE SHEETS / DRIVE
 # =============================================================================
 
-@st.cache_resource(scope="session")
 def google_services():
     if "gcp_service_account" not in st.secrets:
         raise RuntimeError("As credenciais gcp_service_account não estão configuradas nos Secrets.")
@@ -225,7 +224,7 @@ def google_services():
             "https://www.googleapis.com/auth/drive",
         ],
     )
-    return build("sheets", "v4", credentials=credentials), build("drive", "v3", credentials=credentials)
+    return build("sheets", "v4", credentials=credentials, cache_discovery=False), build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
 def spreadsheet_id() -> str:
