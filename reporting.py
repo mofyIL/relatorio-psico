@@ -100,7 +100,7 @@ ESCALA_ORDEM = [
     "SEMPRE",
 ]
 
-ESCALA_CURTA = ["Nunca/Q. nunca", "Raramente", "Às vezes", "Frequentemente", "Sempre"]
+ESCALA_CURTA = ["Nunca/QN", "Raramente", "Às vezes", "Freq.", "Sempre"]
 
 BASE_COLS = {
     "CARIMBO_DE_DATA_HORA",
@@ -127,7 +127,8 @@ class ReportConfig:
     min_group_size: int = 5
     min_answer_fraction: float = 0.50
     show_detailed_distribution: bool = True
-    report_version: str = "2.0"
+    report_version: str = "3.0"
+    methodology_status: str = "Em validação técnica"
 
 
 @dataclass
@@ -424,6 +425,13 @@ def _set_table_borders(table, color: str = "D1D5DB", size: str = "4") -> None:
         element.set(qn("w:color"), color)
 
 
+def _set_picture_alt_text(inline_shape, *, title: str, description: str) -> None:
+    """Adiciona título e texto alternativo ao gráfico para acessibilidade."""
+    doc_pr = inline_shape._inline.docPr
+    doc_pr.set("title", title)
+    doc_pr.set("descr", description)
+
+
 def _set_doc_styles(doc: Document) -> None:
     normal = doc.styles["Normal"]
     normal.font.name = "Arial"
@@ -441,6 +449,7 @@ def _set_doc_styles(doc: Document) -> None:
         style.font.size = Pt(size)
         style.font.color.rgb = RGBColor.from_string(color)
         style.font.bold = True
+        style.paragraph_format.keep_with_next = True
 
 
 def _configure_portrait_section(section) -> None:
@@ -482,9 +491,10 @@ def _add_cover(
     respondents: int,
     generated_at: datetime,
     version: str,
+    methodology_status: str,
 ) -> None:
     spacer = doc.add_paragraph()
-    spacer.paragraph_format.space_after = Pt(38)
+    spacer.paragraph_format.space_after = Pt(32)
 
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -510,7 +520,7 @@ def _add_cover(
     r3.font.color.rgb = RGBColor.from_string("4B5563")
 
     doc.add_paragraph("")
-    table = doc.add_table(rows=4, cols=2)
+    table = doc.add_table(rows=5, cols=2)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.autofit = False
     table.columns[0].width = Cm(5.0)
@@ -521,6 +531,7 @@ def _add_cover(
         ("Respostas analisadas", respondents),
         ("Data de emissão", generated_at.strftime("%d/%m/%Y %H:%M")),
         ("Versão do relatório", version),
+        ("Status metodológico", methodology_status),
     ]
     for row, (label, value) in zip(table.rows, info):
         _set_cell_bg(row.cells[0], "EAF2F8")
@@ -532,7 +543,7 @@ def _add_cover(
     doc.add_paragraph("")
     notice = doc.add_paragraph()
     notice.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    notice.paragraph_format.space_before = Pt(18)
+    notice.paragraph_format.space_before = Pt(14)
     rn = notice.add_run(
         "Uso organizacional. Este documento não realiza diagnóstico clínico individual e não substitui a avaliação técnica "
         "integrada prevista no gerenciamento de riscos ocupacionais."
@@ -543,12 +554,20 @@ def _add_cover(
     rn.font.color.rgb = RGBColor.from_string("6B7280")
     doc.add_page_break()
 
-
-def _add_scope_and_method(doc: Document, scope: str, suppressed_sectors: Iterable[str] | None = None) -> None:
+def _add_scope_and_method(
+    doc: Document,
+    scope: str,
+    suppressed_sectors: Iterable[str] | None = None,
+    methodology_status: str = "Em validação técnica",
+) -> None:
     doc.add_heading("1. Escopo e interpretação", level=1)
     p = doc.add_paragraph()
     p.add_run("Escopo analisado: ").bold = True
     p.add_run(scope)
+
+    status = doc.add_paragraph()
+    status.add_run("Status metodológico: ").bold = True
+    status.add_run(methodology_status)
 
     paragraphs = [
         "Os escores são apresentados em escala de 0 a 100, orientada para exposição: quanto maior o valor, maior a percepção de condições que merecem investigação e prevenção.",
@@ -556,15 +575,18 @@ def _add_scope_and_method(doc: Document, scope: str, suppressed_sectors: Iterabl
         "A análise deve ser combinada com observação do trabalho real, entrevistas, participação dos trabalhadores, dados de SST e avaliação técnica das medidas de prevenção.",
         "As respostas são tratadas de forma coletiva. Resultados de grupos abaixo do mínimo configurado são suprimidos para reduzir o risco de identificação indireta.",
     ]
-    for text in paragraphs:
-        doc.add_paragraph(text, style="List Bullet")
+    for item in paragraphs:
+        doc.add_paragraph(item, style="List Bullet")
 
-    suppressed = [s for s in (suppressed_sectors or []) if s]
-    if suppressed:
+    suppressed_count = len([s for s in (suppressed_sectors or []) if s])
+    if suppressed_count:
         p2 = doc.add_paragraph()
-        p2.add_run("Setores não exibidos individualmente: ").bold = True
-        p2.add_run(", ".join(sorted(suppressed)))
-
+        p2.add_run("Proteção de confidencialidade: ").bold = True
+        noun = "recorte setorial foi suprimido" if suppressed_count == 1 else "recortes setoriais foram suprimidos"
+        p2.add_run(
+            f"{suppressed_count} {noun} por não atingir o mínimo de participantes. "
+            "Os nomes desses grupos não são exibidos neste documento."
+        )
 
 def _add_factor_cards(doc: Document, factor_results: pd.DataFrame) -> None:
     doc.add_heading("2. Síntese dos fatores", level=1)
@@ -624,10 +646,20 @@ def _add_factor_chart(doc: Document, factor_results: pd.DataFrame, scope: str) -
     paragraph = doc.add_paragraph()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = paragraph.add_run()
-    run.add_picture(chart, width=Inches(6.8))
+    shape = run.add_picture(chart, width=Inches(6.8))
+    summary = "; ".join(
+        f"{row['Fator']}: {row['Escore']} pontos, {row['Faixa']}"
+        for _, row in factor_results.iterrows()
+    )
+    _set_picture_alt_text(
+        shape,
+        title=f"Indicadores por fator - {scope}",
+        description=f"Gráfico de barras horizontais. {summary}.",
+    )
 
 
 def _add_attention_items(doc: Document, question_results: pd.DataFrame) -> None:
+    doc.add_page_break()
     doc.add_heading("3. Itens com maior escore de exposição", level=1)
     top = top_attention_items(question_results, 6)
     if top.empty:
@@ -674,48 +706,71 @@ def _add_distribution_appendix(doc: Document, question_results: pd.DataFrame) ->
     section = doc.add_section(WD_SECTION.NEW_PAGE)
     section.orientation = WD_ORIENT.LANDSCAPE
     section.page_width, section.page_height = section.page_height, section.page_width
-    section.top_margin = Cm(1.2)
-    section.bottom_margin = Cm(1.2)
-    section.left_margin = Cm(1.2)
-    section.right_margin = Cm(1.2)
+    section.top_margin = Cm(1.0)
+    section.bottom_margin = Cm(1.0)
+    section.left_margin = Cm(1.0)
+    section.right_margin = Cm(1.0)
 
-    doc.add_heading("Anexo - distribuição das respostas", level=1)
-    doc.add_paragraph(
-        "A distribuição ajuda a identificar heterogeneidade das percepções. O escore de exposição já considera o sentido positivo ou negativo de cada item."
-    )
-    cols = ["Numero", "Pergunta", "Escore_exposicao", "Faixa", *ESCALA_CURTA]
-    table = doc.add_table(rows=1, cols=len(cols))
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.autofit = False
-    widths = [Cm(0.8), Cm(9.4), Cm(1.5), Cm(2.5), Cm(2.0), Cm(2.0), Cm(2.0), Cm(2.0), Cm(2.0)]
-    for idx, width in enumerate(widths):
-        table.columns[idx].width = width
-    labels = ["Nº", "Pergunta", "Escore", "Faixa", *ESCALA_CURTA]
-    for i, label in enumerate(labels):
-        _set_cell_bg(table.rows[0].cells[i], "16324F")
-        _set_cell_text(table.rows[0].cells[i], label, bold=True, size=7.5, color="FFFFFF", align="center")
-        _set_cell_margins(table.rows[0].cells[i], top=45, bottom=45, start=45, end=45)
-    _repeat_table_header(table.rows[0])
-    for _, row in question_results.iterrows():
-        cells = table.add_row().cells
-        values = [
-            int(row["Numero"]),
-            str(row["Pergunta"]).capitalize(),
-            "-" if pd.isna(row["Escore_exposicao"]) else f"{float(row['Escore_exposicao']):.1f}",
-            row["Faixa"],
-            *[row.get(label, "") for label in ESCALA_CURTA],
-        ]
-        for i, value in enumerate(values):
-            _set_cell_text(cells[i], value, size=7.1, align="left" if i == 1 else "center")
-            _set_cell_margins(cells[i], top=35, bottom=35, start=35, end=35)
-        bg, fg = exposure_color(str(row["Faixa"]))
-        _set_cell_bg(cells[3], bg)
-        for run in cells[3].paragraphs[0].runs:
-            run.font.color.rgb = RGBColor.from_string(fg)
-            run.bold = True
-        _prevent_row_split(table.rows[-1])
-    _set_table_borders(table, size="3")
+    rows_per_page = 14
+    chunks = [
+        question_results.iloc[start : start + rows_per_page]
+        for start in range(0, len(question_results), rows_per_page)
+    ] or [question_results]
 
+    for part_index, chunk in enumerate(chunks, start=1):
+        if part_index > 1:
+            doc.add_page_break()
+
+        heading = "Anexo - distribuição das respostas"
+        if len(chunks) > 1:
+            heading += f" ({part_index}/{len(chunks)})"
+        doc.add_heading(heading, level=1)
+        doc.add_paragraph(
+            "A distribuição ajuda a identificar heterogeneidade das percepções. "
+            "O escore de exposição já considera o sentido positivo ou negativo de cada item."
+        )
+
+        cols = ["Numero", "Pergunta", "Escore_exposicao", "Faixa", *ESCALA_CURTA]
+        table = doc.add_table(rows=1, cols=len(cols))
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.autofit = False
+        widths = [Cm(0.8), Cm(10.8), Cm(1.4), Cm(2.3), Cm(1.9), Cm(1.9), Cm(1.9), Cm(1.9), Cm(1.9)]
+        for idx, width in enumerate(widths):
+            table.columns[idx].width = width
+
+        labels = ["Nº", "Pergunta", "Escore", "Faixa", *ESCALA_CURTA]
+        for i, label in enumerate(labels):
+            _set_cell_bg(table.rows[0].cells[i], "16324F")
+            _set_cell_text(
+                table.rows[0].cells[i],
+                label,
+                bold=True,
+                size=7.8,
+                color="FFFFFF",
+                align="center",
+            )
+            _set_cell_margins(table.rows[0].cells[i], top=45, bottom=45, start=35, end=35)
+        _repeat_table_header(table.rows[0])
+
+        for _, row in chunk.iterrows():
+            cells = table.add_row().cells
+            values = [
+                int(row["Numero"]),
+                str(row["Pergunta"]).capitalize(),
+                "-" if pd.isna(row["Escore_exposicao"]) else f"{float(row['Escore_exposicao']):.1f}",
+                row["Faixa"],
+                *[row.get(label, "") for label in ESCALA_CURTA],
+            ]
+            for i, value in enumerate(values):
+                _set_cell_text(cells[i], value, size=7.8, align="left" if i == 1 else "center")
+                _set_cell_margins(cells[i], top=45, bottom=45, start=35, end=35)
+            bg, fg = exposure_color(str(row["Faixa"]))
+            _set_cell_bg(cells[3], bg)
+            for run in cells[3].paragraphs[0].runs:
+                run.font.color.rgb = RGBColor.from_string(fg)
+                run.bold = True
+            _prevent_row_split(table.rows[-1])
+        _set_table_borders(table, size="3")
 
 def _safe_filename(text: str) -> str:
     normalized = normalize_text(text)
@@ -750,8 +805,14 @@ def create_collective_report(
         respondents=len(df_scope),
         generated_at=generated_at,
         version=config.report_version,
+        methodology_status=config.methodology_status,
     )
-    _add_scope_and_method(doc, scope, suppressed_sectors)
+    _add_scope_and_method(
+        doc,
+        scope,
+        suppressed_sectors,
+        methodology_status=config.methodology_status,
+    )
     _add_factor_cards(doc, factor_results)
     _add_factor_chart(doc, factor_results, scope)
     _add_attention_items(doc, question_results)
