@@ -18,6 +18,7 @@ import pandas as pd
 import qrcode
 import streamlit as st
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -254,19 +255,68 @@ def execute_google_read(
 
 
 
-def google_services():
+def sheets_service():
     if "gcp_service_account" not in st.secrets:
-        raise RuntimeError("As credenciais gcp_service_account não estão configuradas nos Secrets.")
+        raise RuntimeError(
+            "As credenciais gcp_service_account não estão configuradas nos Secrets."
+        )
+
     credentials_info = dict(st.secrets["gcp_service_account"])
-    credentials_info["private_key"] = credentials_info["private_key"].replace("\\n", "\n")
+    credentials_info["private_key"] = credentials_info["private_key"].replace(
+        "\\n",
+        "\n",
+    )
+
     credentials = service_account.Credentials.from_service_account_info(
         credentials_info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
-    return build("sheets", "v4", credentials=credentials, cache_discovery=False), build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+    return build(
+        "sheets",
+        "v4",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+
+def drive_service():
+    if "google_drive_oauth" not in st.secrets:
+        raise RuntimeError(
+            "Configure google_drive_oauth nos Secrets para armazenar relatórios "
+            "no seu Google Drive pessoal."
+        )
+
+    cfg = st.secrets["google_drive_oauth"]
+    required = ("client_id", "client_secret", "refresh_token")
+    missing = [
+        name
+        for name in required
+        if not str(cfg.get(name, "")).strip()
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Campos OAuth do Drive ausentes: " + ", ".join(missing)
+        )
+
+    credentials = UserCredentials(
+        token=None,
+        refresh_token=str(cfg["refresh_token"]).strip(),
+        token_uri=str(
+            cfg.get("token_uri", "https://oauth2.googleapis.com/token")
+        ).strip(),
+        client_id=str(cfg["client_id"]).strip(),
+        client_secret=str(cfg["client_secret"]).strip(),
+        scopes=["https://www.googleapis.com/auth/drive"],
+    )
+
+    return build(
+        "drive",
+        "v3",
+        credentials=credentials,
+        cache_discovery=False,
+    )
 
 
 def spreadsheet_id() -> str:
@@ -278,7 +328,7 @@ def spreadsheet_id() -> str:
 
 def read_sheet(sheet_name: str) -> pd.DataFrame:
     result = execute_google_read(
-        lambda: google_services()[0]
+        lambda: sheets_service()
         .spreadsheets()
         .values()
         .get(
@@ -308,7 +358,7 @@ def read_sheet(sheet_name: str) -> pd.DataFrame:
 
 def get_sheet_headers(sheet_name: str) -> list[str]:
     result = execute_google_read(
-        lambda: google_services()[0]
+        lambda: sheets_service()
         .spreadsheets()
         .values()
         .get(
@@ -324,7 +374,7 @@ def get_sheet_headers(sheet_name: str) -> list[str]:
 
 def ensure_sheet(sheet_name: str, headers: list[str]) -> None:
     """Cria a aba ou acrescenta colunas ausentes sem apagar a estrutura existente."""
-    sheets, _ = google_services()
+    sheets = sheets_service()
     metadata = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id()).execute()
     existing = {item["properties"]["title"] for item in metadata.get("sheets", [])}
     if sheet_name not in existing:
@@ -376,7 +426,7 @@ def ensure_structure() -> None:
 def append_row(sheet_name: str, headers: list[str], data: dict[str, Any]) -> None:
     ensure_sheet(sheet_name, headers)
     actual_headers = get_sheet_headers(sheet_name)
-    sheets, _ = google_services()
+    sheets = sheets_service()
     values = [[data.get(header, "") for header in actual_headers]]
     sheets.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id(),
@@ -403,14 +453,14 @@ def update_row(sheet_name: str, headers: list[str], current: dict[str, Any] | pd
         data.append({"range": f"'{sheet_name}'!{cell}", "values": [[value]]})
     if not data:
         return
-    sheets, _ = google_services()
+    sheets = sheets_service()
     sheets.spreadsheets().values().batchUpdate(
         spreadsheetId=spreadsheet_id(),
         body={"valueInputOption": "RAW", "data": data},
     ).execute()
 
 def upload_zip_to_drive(content: bytes, filename: str) -> str:
-    _, drive = google_services()
+    drive = drive_service()
     folder_id = str(st.secrets.get("drive", {}).get("folder_id", "")).strip()
     metadata: dict[str, Any] = {
         "name": filename,
@@ -424,7 +474,7 @@ def upload_zip_to_drive(content: bytes, filename: str) -> str:
 
 
 def download_drive_file(file_id: str) -> bytes:
-    _, drive = google_services()
+    drive = drive_service()
     request = drive.files().get_media(fileId=file_id)
     buffer = BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
