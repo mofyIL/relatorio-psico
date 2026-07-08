@@ -614,6 +614,18 @@ def _configure_portrait_section(section) -> None:
     section.footer_distance = Cm(0.6)
 
 
+def _configure_landscape_section(section) -> None:
+    section.orientation = WD_ORIENT.LANDSCAPE
+    if section.page_width < section.page_height:
+        section.page_width, section.page_height = section.page_height, section.page_width
+    section.top_margin = Cm(1.0)
+    section.bottom_margin = Cm(1.0)
+    section.left_margin = Cm(1.0)
+    section.right_margin = Cm(1.0)
+    section.header_distance = Cm(0.5)
+    section.footer_distance = Cm(0.5)
+
+
 def _add_header_footer(doc: Document, company: str, cycle_label: str) -> None:
     for section in doc.sections:
         header = section.header
@@ -894,6 +906,8 @@ def _add_recommendations(doc: Document, factor_results: pd.DataFrame) -> None:
         p = doc.add_paragraph(style="List Bullet")
         p.add_run(recommendation)
 
+    section = doc.add_section(WD_SECTION.NEW_PAGE)
+    _configure_landscape_section(section)
     doc.add_heading("4.1 Plano de ação para validação na devolutiva", level=2)
     doc.add_paragraph(
         "A tabela abaixo é uma proposta inicial. Antes de implementação, recomenda-se validá-la com a empresa, trabalhadores, liderança e responsável técnico, considerando evidências adicionais e viabilidade operacional."
@@ -925,31 +939,9 @@ def _add_recommendations(doc: Document, factor_results: pd.DataFrame) -> None:
         _prevent_row_split(table.rows[-1])
     _set_table_borders(table, size="3")
 
-    doc.add_heading("4.2 Roteiro sugerido para a reunião pós-entrega", level=2)
-    for item in [
-        "Explicar escopo, limites e proteção de confidencialidade antes de apresentar escores.",
-        "Discutir primeiro os fatores prioritários e itens de maior exposição, evitando atribuição individual de culpa.",
-        "Cruzar achados com observação do trabalho, entrevistas, dados de SST/RH e contexto operacional.",
-        "Transformar medidas escolhidas em responsáveis, prazos, indicadores e registro para acompanhamento no PGR/AEP quando aplicável.",
-        "Definir data de revisão e critério de sucesso para o próximo ciclo.",
-    ]:
-        p = doc.add_paragraph(style="List Number")
-        p.add_run(item)
-
-    p = doc.add_paragraph()
-    p.add_run("Próximo ciclo: ").bold = True
-    p.add_run(
-        "acompanhar a execução das medidas, registrar responsáveis e prazos e repetir a avaliação para verificar mudança das condições de trabalho."
-    )
-
 def _add_distribution_appendix(doc: Document, question_results: pd.DataFrame) -> None:
     section = doc.add_section(WD_SECTION.NEW_PAGE)
-    section.orientation = WD_ORIENT.LANDSCAPE
-    section.page_width, section.page_height = section.page_height, section.page_width
-    section.top_margin = Cm(1.0)
-    section.bottom_margin = Cm(1.0)
-    section.left_margin = Cm(1.0)
-    section.right_margin = Cm(1.0)
+    _configure_landscape_section(section)
 
     rows_per_page = 14
     chunks = [

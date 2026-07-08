@@ -1244,6 +1244,55 @@ def build_response_link(token: str) -> str:
     return f"{base_url.rstrip('/')}?{query}"
 
 
+def inject_response_form_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stForm"] {
+            padding-bottom: 1.25rem;
+        }
+        div[data-testid="stRadio"] {
+            margin: 0.75rem 0 1.15rem 0;
+            padding: 0.85rem 0.95rem;
+            border: 1px solid rgba(49, 51, 63, 0.14);
+            border-radius: 8px;
+            background: rgba(250, 250, 252, 0.72);
+        }
+        div[data-testid="stRadio"] > label {
+            margin-bottom: 0.65rem;
+            line-height: 1.38;
+            font-weight: 650;
+        }
+        div[data-testid="stRadio"] div[role="radiogroup"] {
+            gap: 0.38rem;
+        }
+        div[data-testid="stRadio"] div[role="radiogroup"] label {
+            padding: 0.42rem 0.25rem;
+            min-height: 2.15rem;
+            align-items: flex-start;
+        }
+        div[data-testid="stRadio"] p {
+            line-height: 1.32;
+        }
+        @media (max-width: 640px) {
+            section.main div.block-container {
+                padding-left: 1rem;
+                padding-right: 1rem;
+            }
+            div[data-testid="stRadio"] {
+                padding: 0.9rem 0.8rem;
+            }
+            div[data-testid="column"] {
+                width: 100% !important;
+                flex: 1 1 100% !important;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def create_zip(reports, manifest: dict[str, Any]) -> bytes:
     output = BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -1347,6 +1396,7 @@ def generate_and_store_reports(company: pd.Series, cycle: pd.Series, responses: 
 
 def render_response_form() -> None:
     st.title("Escuta psicossocial")
+    inject_response_form_styles()
     if not backend_is_supabase():
         st.error("A coleta própria pelo app requer `backend_provider = \"supabase\"`.")
         st.stop()
@@ -1415,7 +1465,7 @@ def render_response_form() -> None:
                     str(question["text"]),
                     LIKERT_OPTIONS,
                     index=None,
-                    horizontal=True,
+                    horizontal=False,
                     key=f"q_{campaign.get('id')}_{question['code']}",
                 )
 
