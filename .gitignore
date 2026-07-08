@@ -1,0 +1,40 @@
+# Ambientes e caches
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets e credenciais
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+.streamlit/secret.toml
+credentials.json
+token.json
+*.pem
+*.key
+
+# Arquivos gerados
+*.zip
+*.docx
+*.pdf
+*.xlsx
+outputs/
+exports/
+
+# Sistema/editor
+.DS_Store
+.vscode/
+.idea/
+.agents/
+.codex/
+
+# Backups locais
+*.backup*
+*.bak
+*.tmp
+dasd
