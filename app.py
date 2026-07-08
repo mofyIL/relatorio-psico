@@ -237,6 +237,14 @@ def credential_pepper() -> str:
     return str(get_app_setting("credential_pepper", "")).strip()
 
 
+def secret_fingerprint(value: str) -> str:
+    """Identificador curto para comparar secrets sem expor o valor real."""
+    value = str(value or "")
+    if not value:
+        return "ausente"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
 def make_stored_secret(raw_value: str, context: str) -> str:
     salt = secure_secrets.token_hex(16)
     pepper = credential_pepper()
@@ -1694,9 +1702,31 @@ def verify_admin_password(password: str) -> bool:
     return bool(expected_plain) and secure_secrets.compare_digest(password, expected_plain)
 
 
+def render_admin_secret_diagnostics() -> None:
+    expected_hash = str(get_app_setting("admin_password_hash", "")).strip()
+    pepper = credential_pepper()
+    expected_plain = str(get_app_setting("admin_password", "")).strip()
+    with st.expander("Diagnóstico de autenticação", expanded=False):
+        st.write(
+            {
+                "admin_password_hash_presente": bool(expected_hash),
+                "admin_password_hash_v2": expected_hash.startswith("v2$") and len(expected_hash.split("$")) == 3,
+                "admin_password_hash_id": secret_fingerprint(expected_hash),
+                "credential_pepper_presente": bool(pepper),
+                "credential_pepper_tamanho": len(pepper),
+                "credential_pepper_id": secret_fingerprint(pepper),
+                "admin_password_legado_configurado": bool(expected_plain),
+            }
+        )
+        st.caption(
+            "Esses IDs servem apenas para comparar o que o app online está lendo; eles não revelam os segredos."
+        )
+
+
 def admin_login() -> bool:
     if not str(get_app_setting("admin_password_hash", get_app_setting("admin_password", ""))).strip():
         st.error("Configure app.admin_password_hash nos Secrets. app.admin_password ainda funciona apenas como compatibilidade temporária.")
+        render_admin_secret_diagnostics()
         return False
     if st.session_state.get("admin_authenticated"):
         return True
@@ -1704,6 +1734,7 @@ def admin_login() -> bool:
     locked, remaining = is_locked(attempt_key)
     if locked:
         st.error(f"Muitas tentativas inválidas. Tente novamente em {remaining // 60 + 1} minuto(s).")
+        render_admin_secret_diagnostics()
         return False
     password = st.text_input("Senha administrativa", type="password")
     if st.button("Entrar no administrativo", type="primary"):
@@ -1715,6 +1746,7 @@ def admin_login() -> bool:
         register_failed_attempt(attempt_key, max_attempts=5, lock_seconds=900)
         log_audit("LOGIN_ADMIN_INVALIDO", actor_type="ADMIN", actor="admin")
         st.error("Senha inválida.")
+    render_admin_secret_diagnostics()
     return False
 
 def render_admin() -> None:
