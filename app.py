@@ -914,6 +914,17 @@ def response_timestamp_column(df: pd.DataFrame) -> str | None:
     return None
 
 
+def parse_response_timestamps(values: pd.Series) -> pd.Series:
+    """Converte timestamps ISO/Supabase e carimbos legados do Forms para horário local sem fuso."""
+    return values.map(
+        lambda value: (
+            pd.NaT
+            if parse_datetime(value) is None
+            else parse_datetime(value).replace(tzinfo=None)  # type: ignore[union-attr]
+        )
+    )
+
+
 def deduplicate_responses(df: pd.DataFrame) -> pd.DataFrame:
     """Remove duplicidades comuns sem depender de dados identificáveis."""
     if df.empty:
@@ -921,7 +932,7 @@ def deduplicate_responses(df: pd.DataFrame) -> pd.DataFrame:
     result = df.drop_duplicates().copy()
     timestamp_col = response_timestamp_column(result)
     if timestamp_col:
-        result["__TS_SORT__"] = pd.to_datetime(result[timestamp_col], dayfirst=True, errors="coerce")
+        result["__TS_SORT__"] = parse_response_timestamps(result[timestamp_col])
         result = result.sort_values("__TS_SORT__", na_position="first")
     for key in ("CODIGO_RESPONDENTE", "EMAIL", "E_MAIL"):
         if key in result.columns and result[key].astype(str).str.strip().ne("").any():
@@ -965,9 +976,7 @@ def filter_cycle_responses(df: pd.DataFrame, company: pd.Series, cycle: pd.Serie
 
     timestamp_col = response_timestamp_column(result)
     if timestamp_col:
-        timestamps = pd.to_datetime(result[timestamp_col], dayfirst=True, errors="coerce")
-        if getattr(timestamps.dt, "tz", None) is not None:
-            timestamps = timestamps.dt.tz_convert(TZ).dt.tz_localize(None)
+        timestamps = parse_response_timestamps(result[timestamp_col])
         start = parse_datetime(cycle.get("INICIO_EM"))
         end = parse_datetime(cycle.get("ENCERRADO_EM"))
         if start:
