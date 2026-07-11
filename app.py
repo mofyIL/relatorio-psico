@@ -43,6 +43,31 @@ from supabase_repository import SupabaseRepository
 # =============================================================================
 
 TZ = ZoneInfo("America/Sao_Paulo")
+PARTICIPANT_NOTICE_VERSION = "2026-07-11-v2"
+PARTICIPANT_NOTICE_TEMPLATES = {
+    PARTICIPANT_NOTICE_VERSION: """
+Você está sendo convidado(a) a responder uma pesquisa coletiva sobre condições psicossociais relacionadas ao trabalho.
+
+### Objetivo
+
+A pesquisa busca identificar percepções coletivas sobre organização do trabalho, liderança, demandas, apoio, autonomia e sentido do trabalho. Os resultados serão usados para apoiar ações de prevenção e melhoria das condições de trabalho.
+
+### Confidencialidade
+
+- A organização receberá apenas resultados coletivos.
+- Não serão entregues relatórios individuais ao empregador.
+- Grupos com menos de **{min_group} participantes** não terão relatório separado; outras supressões podem ser aplicadas para reduzir o risco de identificação.
+- Evite escrever informações que identifiquem você ou colegas nas respostas abertas.
+
+### Dados tratados
+
+As respostas incluem a área de trabalho predefinida pela organização e, se você decidir informar, seu cargo ou função atual. O formulário não solicita nome, CPF ou e-mail. O cargo ou função é opcional e não define o grupo usado no relatório.
+
+### Limites
+
+A pesquisa não realiza diagnóstico clínico individual. Ela é uma ferramenta de escuta e apoio à gestão coletiva de riscos psicossociais e deve ser interpretada junto com outras evidências técnicas.
+""".strip(),
+}
 STATUS_VALIDOS = {
     "COLETA",
     "AGUARDANDO_APROVACAO",
@@ -67,6 +92,7 @@ CICLOS_HEADERS = [
     "EMPRESA_ID",
     "ANO",
     "TOKEN",
+    "PARTICIPANT_TOKEN",
     "PIN_HASH",
     "FUNCIONARIOS_CONTRATADOS",
     "PRECO_POR_FUNCIONARIO",
@@ -342,6 +368,139 @@ def get_app_setting(name: str, default: Any) -> Any:
         return default
 
 
+def campaign_min_group(campaign: dict[str, Any] | pd.Series) -> int:
+    configured = as_int(
+        campaign.get("min_group_size", campaign.get("MIN_GRUPO", "")),
+        0,
+    )
+    if configured <= 0:
+        configured = as_int(get_app_setting("min_group_size", 7), 7)
+    return max(2, configured)
+
+
+def campaign_notice_version(campaign: dict[str, Any] | pd.Series) -> str:
+    return str(
+        campaign.get("notice_version", campaign.get("AVISO_VERSAO", ""))
+        or PARTICIPANT_NOTICE_VERSION
+    ).strip()
+
+
+def parse_area_group_lines(value: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Interpreta uma linha `Área | Grupo`; sem separador, usa o mesmo nome."""
+    mappings: list[tuple[str, str]] = []
+    errors: list[str] = []
+    seen: dict[str, str] = {}
+    for line_number, raw_line in enumerate(str(value or "").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) == 1:
+            area = group = parts[0]
+        elif len(parts) == 2:
+            area, group = parts
+        else:
+            errors.append(
+                f"Linha {line_number}: use somente o formato Área | Grupo de análise."
+            )
+            continue
+        if not area or not group:
+            errors.append(f"Linha {line_number}: informe a área e o grupo de análise.")
+            continue
+        area_key = normalize_text(area)
+        group_key = normalize_text(group)
+        previous = seen.get(area_key)
+        if previous and previous != group_key:
+            errors.append(
+                f"Linha {line_number}: a área '{area}' aparece associada a mais de um grupo."
+            )
+            continue
+        if previous:
+            continue
+        seen[area_key] = group_key
+        mappings.append((area, group))
+    if not mappings and not errors:
+        errors.append("Informe pelo menos uma área e seu grupo de análise.")
+    return mappings, errors
+
+
+def load_campaign_sectors(repo: SupabaseRepository, campaign_id: str) -> list[dict[str, Any]]:
+    """Carrega as áreas congeladas da campanha com fallback para o repositório V2 inicial."""
+    list_method = getattr(repo, "list_campaign_areas", None)
+    if not callable(list_method):
+        list_method = getattr(repo, "list_campaign_sectors", None)
+    if callable(list_method):
+        rows = list_method(campaign_id)
+    else:
+        response = (
+            repo.client.table("campaign_sectors")
+            .select("*")
+            .eq("campaign_id", campaign_id)
+            .execute()
+        )
+        data = getattr(response, "data", None)
+        rows = data if isinstance(data, list) else []
+
+    valid_rows: list[dict[str, Any]] = []
+    for raw_row in rows:
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        area_name = str(row.get("area_name") or row.get("sector_name") or "").strip()
+        group_name = str(
+            row.get("analysis_group_name") or row.get("group_name") or ""
+        ).strip()
+        # Compatibilidade imediata com o schema inicial: enquanto a migration
+        # não for aplicada, o par pode estar armazenado em sector_name.
+        if not group_name and "|" in area_name:
+            area_name, group_name = [part.strip() for part in area_name.split("|", 1)]
+        if not area_name:
+            continue
+        group_name = group_name or area_name
+        row["sector_name"] = area_name
+        row["analysis_group_name"] = group_name
+        row["analysis_group_key"] = str(
+            row.get("analysis_group_key")
+            or row.get("group_id")
+            or normalize_header(group_name).lower()
+        )
+        valid_rows.append(row)
+    return sorted(
+        valid_rows,
+        key=lambda row: (
+            as_int(row.get("sort_order"), 999999),
+            normalize_text(row.get("sector_name", "")),
+        ),
+    )
+
+
+def set_campaign_area_mappings(
+    repo: SupabaseRepository,
+    campaign_id: str,
+    mappings: list[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    """Congela área→grupo no ciclo, inclusive durante o rollout da migration."""
+    set_method = getattr(repo, "set_campaign_areas", None)
+    if callable(set_method):
+        return list(set_method(campaign_id, mappings) or [])
+
+    # Compatibilidade com o primeiro schema Supabase. A migration 003 separa
+    # estes campos; antes dela, o par fica legível em sector_name.
+    table = repo.client.table("campaign_sectors")
+    table.delete().eq("campaign_id", campaign_id).execute()
+    payload = [
+        {
+            "campaign_id": campaign_id,
+            "sector_name": area if normalize_text(area) == normalize_text(group) else f"{area} | {group}",
+            "reportable": True,
+        }
+        for area, group in mappings
+    ]
+    response = table.insert(payload).execute()
+    data = getattr(response, "data", None)
+    return data if isinstance(data, list) else []
+
+
 def backend_is_supabase() -> bool:
     return is_supabase_selected()
 
@@ -385,10 +544,12 @@ def supabase_campaign_to_legacy(row: dict[str, Any]) -> dict[str, Any]:
         "EMPRESA_ID": row.get("company_id", ""),
         "ANO": row.get("cycle_year", ""),
         "TOKEN": row.get("code", ""),
+        "PARTICIPANT_TOKEN": row.get("response_code") or row.get("code", ""),
         "PIN_HASH": row.get("access_token_hash", ""),
         "FUNCIONARIOS_CONTRATADOS": row.get("employees_contracted", 0),
         "PRECO_POR_FUNCIONARIO": row.get("price_per_employee", 0),
         "VALOR_MINIMO": row.get("minimum_price", 0),
+        "MIN_GRUPO": row.get("min_group_size", 7),
         "VALIDO_ATE": row.get("closes_at", ""),
         "STATUS": SUPABASE_STATUS_TO_LEGACY.get(str(row.get("status", "")), "COLETA"),
         "INICIO_EM": row.get("starts_at", ""),
@@ -1309,7 +1470,7 @@ def generate_and_store_reports(company: pd.Series, cycle: pd.Series, responses: 
     ok, validation_msg = response_validation_message(responses)
     if not ok:
         raise ValueError(validation_msg)
-    min_group = max(2, as_int(get_app_setting("min_group_size", 7), 5))
+    min_group = campaign_min_group(cycle)
     report_version = str(get_app_setting("report_version", "4.0-v2-supabase-ready"))
     config = ReportConfig(min_group_size=min_group, report_version=report_version, methodology_status=str(get_app_setting("methodology_status", "Triagem e monitoramento psicossocial; instrumento proprietário em validação técnica")))
     company_name = str(company.get("NOME", "Empresa"))
@@ -1391,8 +1552,54 @@ def generate_and_store_reports(company: pd.Series, cycle: pd.Series, responses: 
 
 
 # =============================================================================
-# INTERFACE: CLIENTE
+# INTERFACE: PARTICIPANTE
 # =============================================================================
+
+def render_participant_notice(company: dict[str, Any], campaign: dict[str, Any]) -> None:
+    version = campaign_notice_version(campaign)
+    template = PARTICIPANT_NOTICE_TEMPLATES.get(
+        version,
+        PARTICIPANT_NOTICE_TEMPLATES[PARTICIPANT_NOTICE_VERSION],
+    )
+    controller = str(
+        campaign.get("notice_controller")
+        or company.get("lgpd_controller_name")
+        or company.get("trade_name")
+        or company.get("legal_name")
+        or "Organização responsável pela pesquisa"
+    ).strip()
+    operator = str(
+        campaign.get("notice_operator")
+        or get_app_setting("operator_name", "Responsável pela operação da pesquisa")
+    ).strip()
+    contact = str(
+        campaign.get("notice_contact")
+        or company.get("lgpd_contact_email")
+        or company.get("responsible_email")
+        or get_app_setting("privacy_contact", "Canal informado pela organização")
+    ).strip()
+    retention = str(
+        campaign.get("notice_retention")
+        or get_app_setting(
+            "retention_policy",
+            "Conforme o contrato e a política de privacidade aplicáveis a esta pesquisa",
+        )
+    ).strip()
+
+    st.subheader("Aviso aos participantes")
+    st.markdown(template.format(min_group=campaign_min_group(campaign)))
+    st.markdown(
+        f"""
+### Responsáveis e retenção
+
+- **Controlador dos dados:** {controller}
+- **Operador/prestador do serviço:** {operator}
+- **Contato para dúvidas e direitos dos titulares:** {contact}
+- **Prazo e critério de retenção:** {retention}
+"""
+    )
+    st.caption(f"Versão do aviso: {version}")
+
 
 def render_response_form() -> None:
     st.title("Escuta psicossocial")
@@ -1407,7 +1614,12 @@ def render_response_form() -> None:
         st.stop()
 
     repo = supabase_repository()
-    campaign = repo.get_campaign_by_code(token)
+    response_lookup = getattr(repo, "get_campaign_by_response_code", None)
+    campaign = response_lookup(token) if callable(response_lookup) else None
+    if not campaign:
+        legacy_campaign = repo.get_campaign_by_code(token)
+        if not callable(response_lookup) or not str(legacy_campaign.get("response_code") if legacy_campaign else "").strip():
+            campaign = legacy_campaign
     if not campaign:
         st.error("Campanha não encontrada ou link revogado.")
         st.stop()
@@ -1421,17 +1633,51 @@ def render_response_form() -> None:
         st.error("O prazo de resposta desta campanha expirou.")
         st.stop()
 
-    submitted_key = f"response_submitted_{campaign.get('id')}"
+    campaign_id = str(campaign.get("id") or "")
+    notice_version = campaign_notice_version(campaign)
+    submitted_key = f"response_submitted_{campaign_id}"
+    accepted_key = f"notice_accepted_{campaign_id}_{notice_version}"
+    declined_key = f"notice_declined_{campaign_id}_{notice_version}"
+    decision_key = f"notice_decision_{campaign_id}_{notice_version}"
     if st.session_state.get(submitted_key):
         st.success("Resposta registrada. Obrigado por participar.")
         st.caption("As respostas serão analisadas de forma coletiva, sem relatório individual para a empresa.")
         st.stop()
 
     st.subheader(str(company.get("trade_name") or company.get("legal_name") or "Empresa"))
-    st.caption(
-        "Não informe nome, CPF, e-mail ou dados que identifiquem você nas respostas abertas. "
-        "Os resultados são tratados de forma coletiva para triagem e monitoramento."
-    )
+    if st.session_state.get(declined_key):
+        st.info("Você decidiu não participar. Nenhuma resposta foi coletada e esta página já pode ser fechada.")
+        st.stop()
+
+    if not st.session_state.get(accepted_key):
+        render_participant_notice(company, campaign)
+        decision = st.radio(
+            "Depois de ler o aviso, escolha uma opção:",
+            (
+                "Li as informações e desejo participar",
+                "Não desejo participar",
+            ),
+            index=None,
+            key=decision_key,
+        )
+        continue_clicked = st.button(
+            "Continuar",
+            type="primary",
+            disabled=decision is None,
+            use_container_width=True,
+        )
+
+        if continue_clicked:
+            if decision == "Li as informações e desejo participar":
+                st.session_state[accepted_key] = iso_now()
+            else:
+                st.session_state[declined_key] = True
+                st.rerun()
+        else:
+            st.stop()
+
+    with st.expander("Rever o aviso aos participantes"):
+        render_participant_notice(company, campaign)
 
     questions = repo.list_questions(str(campaign["questionnaire_id"]))
     closed_questions = [q for q in questions if q.get("question_type") == "likert_frequency"]
@@ -1447,15 +1693,43 @@ def render_response_form() -> None:
         code = str(domain.get("code") or "GERAL")
         domain_names[code] = str(domain.get("name") or code)
 
-    with st.form(f"response_form_{campaign.get('id')}"):
-        consent = st.checkbox(
-            "Declaro que li o aviso da pesquisa e aceito participar de forma voluntária.",
-            value=False,
+    campaign_sectors = load_campaign_sectors(repo, campaign_id)
+    sector_options = {
+        str(row.get("id") or f"sector-{index}"): row
+        for index, row in enumerate(campaign_sectors)
+    }
+
+    with st.form(f"response_form_{campaign_id}"):
+        selected_sector_id: str | None = None
+        legacy_area = ""
+        if sector_options:
+            selected_sector_id = st.selectbox(
+                "Em qual área você trabalha?",
+                list(sector_options.keys()),
+                index=None,
+                placeholder="Selecione uma área",
+                format_func=lambda value: str(
+                    sector_options.get(value, {}).get("sector_name") or value
+                ),
+                help="As opções foram definidas previamente pela organização.",
+                key=f"response_area_{campaign_id}",
+            )
+        else:
+            st.warning(
+                "Esta campanha ainda usa a estrutura anterior. Informe sua área conforme a nomenclatura adotada pela organização."
+            )
+            legacy_area = st.text_input(
+                "Área de trabalho",
+                max_chars=80,
+                key=f"response_legacy_area_{campaign_id}",
+            )
+
+        current_role = st.text_input(
+            "Cargo ou função atual (opcional)",
+            max_chars=80,
+            help="Este campo não define o grupo do relatório. Deixe em branco se puder identificar você.",
+            key=f"response_role_{campaign_id}",
         )
-        col1, col2, col3 = st.columns(3)
-        sector = col1.text_input("Setor ou área", max_chars=80)
-        work_unit = col2.text_input("Unidade/local", max_chars=80)
-        role_family = col3.text_input("Família de cargo", max_chars=80)
 
         answers: dict[str, str | None] = {}
         for domain_code, domain_name in domain_names.items():
@@ -1483,20 +1757,39 @@ def render_response_form() -> None:
 
     if submitted:
         missing = [code for code, value in answers.items() if not value]
-        if not consent:
-            st.error("Confirme o aceite para registrar a participação.")
+        if not st.session_state.get(accepted_key):
+            st.error("Leia e confirme o aviso antes de responder.")
+            st.stop()
+        if sector_options and (not selected_sector_id or selected_sector_id not in sector_options):
+            st.error("Selecione sua área de trabalho.")
+            st.stop()
+        if not sector_options and not legacy_area.strip():
+            st.error("Informe sua área de trabalho.")
             st.stop()
         if missing:
             st.error(f"Responda todos os {len(REPORT_QUESTIONARIO)} itens fechados antes de enviar.")
             st.stop()
+
+        selected_sector = sector_options.get(str(selected_sector_id), {})
+        group_name = str(
+            selected_sector.get("analysis_group_name")
+            or selected_sector.get("sector_name")
+            or legacy_area
+        ).strip()
         repo.create_response(
-            str(campaign["id"]),
+            campaign_id,
             {
-                "sector": sector.strip(),
-                "work_unit": work_unit.strip(),
-                "role_family": role_family.strip(),
+                # O grupo é resolvido da estrutura congelada, nunca digitado livremente
+                # quando a campanha possui áreas predefinidas.
+                "sector": group_name,
+                "campaign_area_id": selected_sector_id,
+                "analysis_group_key": selected_sector.get("analysis_group_key"),
+                "analysis_group_name": group_name,
+                "role_family": current_role.strip(),
                 "source": "streamlit_response_form",
                 "consent_accepted": True,
+                "notice_version": notice_version,
+                "notice_accepted_at": st.session_state[accepted_key],
             },
             answers,
             open_payload,
@@ -1508,9 +1801,9 @@ def render_response_form() -> None:
             cycle_id=str(campaign.get("id", "")),
             details={
                 "origem": "streamlit_response_form",
-                "setor_informado": bool(sector.strip()),
-                "unidade_informada": bool(work_unit.strip()),
-                "cargo_informado": bool(role_family.strip()),
+                "area_predefinida_selecionada": bool(sector_options),
+                "cargo_informado": bool(current_role.strip()),
+                "aviso_versao": notice_version,
             },
         )
         st.session_state[submitted_key] = True
@@ -1579,7 +1872,7 @@ def render_client() -> None:
     status = safe_status(cycle.get("STATUS"))
     contracted, unit_price, contract_value, over_limit = contracted_value(cycle, response_count)
     valid_until = parse_date(cycle.get("VALIDO_ATE"))
-    min_group = max(2, as_int(get_app_setting("min_group_size", 7), 5))
+    min_group = campaign_min_group(cycle)
     instrument_ok, instrument_msg = response_validation_message(responses)
 
     st.subheader(str(company.get("NOME", "Empresa")))
@@ -1619,7 +1912,9 @@ def render_client() -> None:
     if status == "COLETA":
         st.info("A coleta está aberta. Compartilhe somente o link do formulário com os funcionários.")
         if backend_is_supabase():
-            response_link = build_response_link(token)
+            response_link = build_response_link(
+                str(cycle.get("PARTICIPANT_TOKEN") or token)
+            )
             st.code(response_link, language=None)
             st.link_button("Abrir formulário de resposta", response_link, use_container_width=True)
         else:
@@ -1856,10 +2151,35 @@ def render_admin() -> None:
             cnpj = st.text_input("CNPJ")
             responsible = st.text_input("Responsável")
             email = st.text_input("E-mail do responsável")
+            company_structure_text = (
+                st.text_area(
+                    "Áreas e grupos de análise",
+                    placeholder=(
+                        "Vendas | Administrativo\n"
+                        "Recursos Humanos | Administrativo\n"
+                        "Produção | Operacional"
+                    ),
+                    help=(
+                        "Uma linha por área, no formato Área | Grupo. "
+                        "O participante escolhe a área; o relatório usa o grupo."
+                    ),
+                )
+                if backend_is_supabase()
+                else ""
+            )
             submitted = st.form_submit_button("Cadastrar", type="primary")
         if submitted:
-            if not name.strip():
-                st.error("Informe o nome da empresa.")
+            company_mappings: list[tuple[str, str]] = []
+            structure_errors: list[str] = []
+            if backend_is_supabase():
+                company_mappings, structure_errors = parse_area_group_lines(
+                    company_structure_text
+                )
+            if not name.strip() or structure_errors:
+                if not name.strip():
+                    st.error("Informe o nome da empresa.")
+                for error in structure_errors:
+                    st.error(error)
             else:
                 company_id = make_company_id(name)
                 created = append_row(
@@ -1877,7 +2197,12 @@ def render_admin() -> None:
                 )
                 if created and created.get("EMPRESA_ID"):
                     company_id = str(created["EMPRESA_ID"])
-                log_audit("CADASTRAR_EMPRESA", actor_type="ADMIN", actor="admin", company_id=company_id, details={"nome": name.strip()})
+                if backend_is_supabase():
+                    supabase_repository().set_company_areas(
+                        company_id,
+                        company_mappings,
+                    )
+                log_audit("CADASTRAR_EMPRESA", actor_type="ADMIN", actor="admin", company_id=company_id, details={"nome": name.strip(), "areas": len(company_mappings)})
                 st.success(f"Empresa cadastrada: {company_id}")
                 st.rerun()
 
@@ -1897,14 +2222,62 @@ def render_admin() -> None:
                 contracted = st.number_input("Funcionários contratados", min_value=1, value=10, step=1)
                 unit_price = st.number_input("Preço por funcionário (R$)", min_value=0.0, value=0.0, step=1.0)
                 minimum = st.number_input("Valor mínimo da compra (R$)", min_value=0.0, value=0.0, step=10.0)
+                min_group_size = st.number_input(
+                    "Mínimo de respostas por grupo",
+                    min_value=2,
+                    value=max(2, as_int(get_app_setting("min_group_size", 7), 7)),
+                    step=1,
+                    help="Grupos abaixo deste total não recebem relatório separado.",
+                )
+                cycle_structure_text = st.text_area(
+                    "Áreas e grupos deste ciclo",
+                    placeholder=(
+                        "Vendas | Administrativo\n"
+                        "Recursos Humanos | Administrativo\n"
+                        "Produção | Operacional"
+                    ),
+                    help=(
+                        "Informe para substituir/confirmar o cadastro da empresa. "
+                        "Se deixar vazio, o sistema usa as áreas ativas já cadastradas."
+                    ),
+                )
                 validity = st.number_input("Validade do acesso (dias)", min_value=1, value=90, step=1)
                 create = st.form_submit_button("Criar ciclo e credenciais", type="primary")
             if create:
                 company_id = str(company_options[selected_label])
+                repo = supabase_repository() if backend_is_supabase() else None
+                area_mappings: list[tuple[str, str]] = []
+                structure_errors: list[str] = []
+                if repo is not None and cycle_structure_text.strip():
+                    area_mappings, structure_errors = parse_area_group_lines(
+                        cycle_structure_text
+                    )
+                elif repo is not None:
+                    saved_areas = repo.list_company_areas(company_id, active_only=True)
+                    area_mappings = [
+                        (
+                            str(row.get("area_name") or row.get("sector_name") or "").strip(),
+                            str(row.get("analysis_group_name") or row.get("area_name") or "").strip(),
+                        )
+                        for row in saved_areas
+                        if str(row.get("area_name") or row.get("sector_name") or "").strip()
+                    ]
+                    if not area_mappings:
+                        structure_errors.append(
+                            "Informe as áreas e grupos deste ciclo antes de criá-lo."
+                        )
+                if structure_errors:
+                    for error in structure_errors:
+                        st.error(error)
+                    st.stop()
                 cycle_id = make_cycle_id(company_id, int(year))
                 token, pin = make_access_credentials()
                 start = now_sp()
                 valid_until = (start + timedelta(days=int(validity))).date().isoformat()
+                company_row = find_company(companies, company_id)
+                controller_name = str(
+                    company_row.get("NOME", "") if company_row is not None else ""
+                ).strip()
                 created = append_row(
                     SHEET_CICLOS,
                     CICLOS_HEADERS,
@@ -1917,6 +2290,13 @@ def render_admin() -> None:
                         "FUNCIONARIOS_CONTRATADOS": int(contracted),
                         "PRECO_POR_FUNCIONARIO": float(unit_price),
                         "VALOR_MINIMO": float(minimum),
+                        "min_group_size": int(min_group_size),
+                        "notice_version": PARTICIPANT_NOTICE_VERSION,
+                        "notice_controller": controller_name,
+                        "notice_operator": str(get_app_setting("operator_name", "Responsável pela operação da pesquisa")),
+                        "notice_contact": str(get_app_setting("privacy_contact", "Canal informado pela organização")),
+                        "notice_retention": str(get_app_setting("retention_policy", "Conforme contrato e política de privacidade")),
+                        "notice_frozen_at": start.replace(microsecond=0).isoformat(),
                         "VALIDO_ATE": valid_until,
                         "STATUS": "COLETA",
                         "INICIO_EM": start.replace(microsecond=0).isoformat(),
@@ -1927,20 +2307,31 @@ def render_admin() -> None:
                 )
                 if created and created.get("CICLO_ID"):
                     cycle_id = str(created["CICLO_ID"])
+                participant_token = str(
+                    (created or {}).get("PARTICIPANT_TOKEN") or token
+                )
+                if repo is not None:
+                    try:
+                        if cycle_structure_text.strip():
+                            repo.set_company_areas(company_id, area_mappings)
+                        set_campaign_area_mappings(repo, cycle_id, area_mappings)
+                    except Exception:
+                        repo.update_campaign(cycle_id, {"status": "cancelled"})
+                        raise
                 log_audit(
                     "CRIAR_CICLO",
                     actor_type="ADMIN",
                     actor="admin",
                     company_id=company_id,
                     cycle_id=cycle_id,
-                    details={"ano": int(year), "contratados": int(contracted), "validade_dias": int(validity)},
+                    details={"ano": int(year), "contratados": int(contracted), "validade_dias": int(validity), "areas": len(area_mappings), "min_grupo": int(min_group_size)},
                 )
                 st.success("Ciclo criado. Guarde o PIN; apenas o hash foi salvo.")
                 st.caption("Link do painel do cliente")
                 st.code(build_client_link(token), language=None)
                 if backend_is_supabase():
                     st.caption("Link de resposta dos participantes")
-                    st.code(build_response_link(token), language=None)
+                    st.code(build_response_link(participant_token), language=None)
                 st.code(pin, language=None)
                 st.warning("Envie o link e o PIN por canais separados.")
 
@@ -1978,13 +2369,78 @@ def render_admin() -> None:
                     ok_msg = response_validation_message(responses)
                     (st.success if ok_msg[0] else st.warning)(ok_msg[1])
 
+                if backend_is_supabase():
+                    repo = supabase_repository()
+                    configured_areas = load_campaign_sectors(
+                        repo,
+                        str(cycle.get("CICLO_ID", "")),
+                    )
+                    st.markdown("#### Áreas e grupos de análise")
+                    if configured_areas:
+                        st.dataframe(
+                            pd.DataFrame(
+                                [
+                                    {
+                                        "Área mostrada no formulário": row.get("sector_name", ""),
+                                        "Grupo usado no relatório": row.get("analysis_group_name", ""),
+                                    }
+                                    for row in configured_areas
+                                ]
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.warning("Este ciclo ainda não possui áreas predefinidas.")
+
+                    if len(responses) == 0:
+                        with st.form(f"cycle_areas_{cycle.get('CICLO_ID', '')}"):
+                            updated_structure_text = st.text_area(
+                                "Definir áreas antes da primeira resposta",
+                                placeholder=(
+                                    "Vendas | Administrativo\n"
+                                    "Recursos Humanos | Administrativo\n"
+                                    "Produção | Operacional"
+                                ),
+                                help="Ao chegar a primeira resposta, esta estrutura fica congelada.",
+                            )
+                            save_structure = st.form_submit_button(
+                                "Salvar áreas e grupos",
+                                type="primary",
+                            )
+                        if save_structure:
+                            mappings, errors = parse_area_group_lines(
+                                updated_structure_text
+                            )
+                            if errors:
+                                for error in errors:
+                                    st.error(error)
+                            else:
+                                set_campaign_area_mappings(
+                                    repo,
+                                    str(cycle.get("CICLO_ID", "")),
+                                    mappings,
+                                )
+                                if company is not None:
+                                    repo.set_company_areas(
+                                        str(company.get("EMPRESA_ID", "")),
+                                        mappings,
+                                    )
+                                st.success("Estrutura salva para este ciclo.")
+                                st.rerun()
+                    else:
+                        st.caption(
+                            "A estrutura não pode ser alterada depois da primeira resposta. "
+                            "Isso preserva o agrupamento do ciclo."
+                        )
+
                 c1, c2, c3, c4 = st.columns(4)
                 if c1.button("Confirmar pagamento", use_container_width=True):
                     update_row(SHEET_CICLOS, CICLOS_HEADERS, cycle, {"PAGAMENTO_OK": "SIM", "ULTIMA_ACAO_EM": iso_now()})
                     log_audit("CONFIRMAR_PAGAMENTO", actor_type="ADMIN", actor="admin", company_id=str(cycle.get("EMPRESA_ID", "")), cycle_id=str(cycle.get("CICLO_ID", "")), details={"valor": value})
                     st.rerun()
                 if c2.button("Liberar geração", use_container_width=True):
-                    if len(responses) < max(2, as_int(get_app_setting("min_group_size", 7), 5)):
+                    if len(responses) < campaign_min_group(cycle):
                         st.error("Quantidade abaixo do mínimo de confidencialidade.")
                     elif over:
                         st.error("Ajuste o número contratado antes de liberar.")

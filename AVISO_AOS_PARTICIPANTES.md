@@ -15,7 +15,11 @@ A pesquisa busca identificar percepções coletivas sobre organização do traba
 
 ## Dados tratados
 
-As respostas podem incluir setor, cargo/faixa funcional ou outras informações necessárias para análise coletiva. Nome, CPF e e-mail não devem ser coletados salvo necessidade específica informada pela empresa e pelos responsáveis pelo tratamento.
+As respostas incluem uma área de trabalho escolhida entre opções definidas previamente pela organização. Essa área é associada pelo sistema a um grupo de análise coletivo. O campo `Cargo ou função atual` é opcional e não define o grupo do relatório. Nome, CPF e e-mail não são solicitados no formulário anônimo.
+
+## Participação voluntária
+
+Antes de visualizar as perguntas, a pessoa deve escolher explicitamente entre participar ou não participar. Somente o aceite libera o questionário. A recusa encerra o fluxo sem registrar resposta.
 
 ## Limites
 

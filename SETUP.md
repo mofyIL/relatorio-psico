@@ -28,7 +28,8 @@ No Supabase SQL Editor, rode nesta ordem:
 
 1. `supabase/migrations/001_initial_schema.sql`
 2. `supabase/migrations/002_rls_policies.sql`
-3. `supabase/seed_questionnaire_v2.sql`
+3. `supabase/migrations/003_participant_notice_and_analysis_groups.sql`
+4. `supabase/seed_questionnaire_v2.sql`
 
 Crie um bucket privado chamado `reports` no Supabase Storage.
 
@@ -109,6 +110,16 @@ Com Supabase, o admin cria o ciclo e o app mostra:
 - link do painel do cliente, protegido por PIN;
 - link `?respond=...` para os participantes responderem sem identificação pessoal.
 
+Antes de criar ou abrir o ciclo, cadastre as áreas e seus grupos de análise no formato `Área | Grupo`, por exemplo:
+
+```text
+Vendas | Administrativo
+Recursos Humanos | Administrativo
+Produção | Operacional
+```
+
+O participante escolhe a área predefinida e o servidor grava apenas o grupo canônico. O aviso é exibido antes das perguntas; a recusa não cria resposta.
+
 As respostas são gravadas em `responses`, `response_items` e `open_answers`. Comentários abertos não são liberados automaticamente ao cliente.
 
 Com Google Forms legado, o Forms deve ter os 56 itens fechados com textos compatíveis com `questionnaire_v2.py`. Para reduzir erro operacional, crie perguntas de resposta curta para:
@@ -129,14 +140,15 @@ O Forms não torna esses campos realmente ocultos ou imutáveis. O app filtra po
 ## 8. Fluxo comercial
 
 1. Cadastre a empresa.
-2. Crie um ciclo com quantidade contratada, preço, mínimo e validade.
-3. Envie link do painel e PIN por canais separados ao cliente.
-4. Envie o link de resposta aos participantes.
-5. Cliente solicita encerramento.
-6. Admin confere respostas, excesso, pagamento e instrumento.
-7. Admin libera geração.
-8. Cliente gera o pacote definitivo.
-9. Vocês fazem devolutiva pós-entrega e transformam achados em plano de ação.
+2. Cadastre as áreas da empresa e os respectivos grupos de análise.
+3. Crie um ciclo com quantidade contratada, preço, mínimo e validade; a estrutura fica congelada para esse ciclo.
+4. Envie link do painel e PIN por canais separados ao cliente.
+5. Envie o link de resposta aos participantes.
+6. Cliente solicita encerramento.
+7. Admin confere respostas, excesso, pagamento e instrumento.
+8. Admin libera geração.
+9. Cliente gera o pacote definitivo.
+10. Vocês fazem devolutiva pós-entrega e transformam achados em plano de ação.
 
 ## 9. Retenção e privacidade
 
