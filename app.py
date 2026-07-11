@@ -23,7 +23,16 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-from reporting import ReportConfig, generate_company_reports, normalize_dataframe_columns, normalize_text
+from reporting import (
+    ESCALA_ORDEM,
+    FATORES,
+    QUESTIONARIO,
+    ReportConfig,
+    generate_company_reports,
+    normalize_dataframe_columns,
+    normalize_header,
+    normalize_text,
+)
 
 
 # =============================================================================
@@ -31,6 +40,18 @@ from reporting import ReportConfig, generate_company_reports, normalize_datafram
 # =============================================================================
 
 TZ = ZoneInfo("America/Sao_Paulo")
+PARTICIPANT_NOTICE_VERSION = "2026-07-11"
+PARTICIPANT_NOTICE_TEMPLATES = {
+    "2026-07-11": """
+Esta pesquisa tem a finalidade de identificar, de forma coletiva, aspectos da organização e das condições de trabalho que possam orientar ações de prevenção e melhoria.
+
+O formulário não solicita nome, CPF ou e-mail. O campo de cargo ou função é opcional; deixe-o em branco se a informação puder identificar você. Evite informar dados que permitam identificar você ou outras pessoas. As respostas não serão utilizadas para diagnóstico clínico, avaliação de desempenho, punição ou decisão individual sobre trabalhadores.
+
+A organização receberá somente resultados agrupados. Grupos com menos de **{min_group} respostas** não terão relatório separado; outras supressões podem ser aplicadas para impedir inferência por diferença. Essas respostas poderão compor apenas a visão geral. Relatórios individuais não serão entregues à organização.
+
+O acesso às respostas brutas é restrito às pessoas autorizadas pela prestadora do serviço e usado somente para processamento, controle de qualidade e geração dos resultados contratados.
+""".strip(),
+}
 STATUS_VALIDOS = {
     "COLETA",
     "AGUARDANDO_APROVACAO",
@@ -55,6 +76,7 @@ CICLOS_HEADERS = [
     "EMPRESA_ID",
     "ANO",
     "TOKEN",
+    "PARTICIPANT_TOKEN",
     "PIN_HASH",
     "FUNCIONARIOS_CONTRATADOS",
     "PRECO_POR_FUNCIONARIO",
@@ -69,6 +91,34 @@ CICLOS_HEADERS = [
     "VERSAO",
     "PAGAMENTO_OK",
     "OBSERVACOES",
+    "MIN_GRUPO",
+    "AVISO_VERSAO",
+    "AVISO_CONTROLADOR",
+    "AVISO_OPERADOR",
+    "AVISO_CONTATO",
+    "AVISO_RETENCAO",
+]
+
+ESTRUTURA_HEADERS = [
+    "ESTRUTURA_ID",
+    "EMPRESA_ID",
+    "AREA_TRABALHO",
+    "GRUPO_ID",
+    "GRUPO_ANALISE",
+    "ATIVO",
+    "ORDEM",
+    "CRIADO_EM",
+]
+
+ESTRUTURA_CICLO_HEADERS = [
+    "CICLO_ID",
+    "EMPRESA_ID",
+    "ESTRUTURA_ID",
+    "AREA_TRABALHO",
+    "GRUPO_ID",
+    "GRUPO_ANALISE",
+    "ORDEM",
+    "CRIADO_EM",
 ]
 
 RELATORIOS_HEADERS = [
@@ -84,10 +134,27 @@ RELATORIOS_HEADERS = [
     "VERSAO",
 ]
 
+RESPOSTAS_HEADERS = [
+    "CARIMBO_DE_DATA_HORA",
+    "EMPRESA_ID",
+    "CICLO_ID",
+    "NOME_DA_EMPRESA",
+    "GRUPO_ID",
+    "GRUPO_ANALISE",
+    "SETOR",
+    "CARGO_ATUAL",
+    "CIENCIA_AVISO",
+    "AVISO_VERSAO",
+    "CIENCIA_AVISO_EM",
+    *QUESTIONARIO.values(),
+]
+
 SHEET_EMPRESAS = "Empresas"
 SHEET_CICLOS = "Ciclos"
 SHEET_RELATORIOS = "Relatorios"
 SHEET_RESPOSTAS = "Respostas"
+SHEET_ESTRUTURA = "Estrutura"
+SHEET_ESTRUTURA_CICLOS = "EstruturaCiclos"
 
 st.set_page_config(
     page_title="Painel de Indicadores Psicossociais",
@@ -195,8 +262,21 @@ def make_cycle_id(company_id: str, year: int) -> str:
     return f"{company_id}_{year}_{secure_secrets.token_hex(2).upper()}"
 
 
+def make_structure_id(company_id: str) -> str:
+    return f"EST_{hashlib.sha256(company_id.encode('utf-8')).hexdigest()[:8].upper()}_{secure_secrets.token_hex(3).upper()}"
+
+
+def make_group_id(company_id: str, group_name: str) -> str:
+    canonical = f"{company_id}:{normalize_text(group_name)}"
+    return f"GRP_{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:12].upper()}"
+
+
 def make_access_credentials() -> tuple[str, str]:
     return secure_secrets.token_urlsafe(32), f"{secure_secrets.randbelow(1_000_000):06d}"
+
+
+def make_participant_token() -> str:
+    return secure_secrets.token_urlsafe(32)
 
 
 def last_column_letter(column_count: int) -> str:
@@ -213,6 +293,143 @@ def get_app_setting(name: str, default: Any) -> Any:
         return st.secrets["app"].get(name, default)
     except Exception:
         return default
+
+
+def cycle_min_group(cycle: pd.Series | dict[str, Any]) -> int:
+    configured = as_int(cycle.get("MIN_GRUPO", ""), 0)
+    if configured <= 0:
+        configured = as_int(get_app_setting("min_group_size", 5), 5)
+    return max(2, configured)
+
+
+def parse_structure_lines(value: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Interpreta `Área | Grupo`; sem separador, usa o mesmo nome nos dois níveis."""
+    parsed: list[tuple[str, str]] = []
+    errors: list[str] = []
+    seen: dict[str, str] = {}
+
+    for line_number, raw_line in enumerate(str(value).splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) == 1:
+            area = group = parts[0]
+        elif len(parts) == 2:
+            area, group = parts
+        else:
+            errors.append(f"Linha {line_number}: use somente o formato Área | Grupo de análise.")
+            continue
+        if not area or not group:
+            errors.append(f"Linha {line_number}: informe a área e o grupo de análise.")
+            continue
+        area_key = normalize_text(area)
+        group_key = normalize_text(group)
+        previous = seen.get(area_key)
+        if previous and previous != group_key:
+            errors.append(f"Linha {line_number}: a área '{area}' aparece associada a mais de um grupo.")
+            continue
+        if previous:
+            continue
+        seen[area_key] = group_key
+        parsed.append((area, group))
+
+    if not parsed and not errors:
+        errors.append("Informe pelo menos uma área ou grupo de análise.")
+    return parsed, errors
+
+
+def active_company_structures(structures: pd.DataFrame, company_id: str) -> pd.DataFrame:
+    if structures.empty or "EMPRESA_ID" not in structures.columns:
+        return structures.iloc[0:0].copy()
+    result = structures[structures["EMPRESA_ID"].astype(str).str.strip() == str(company_id).strip()].copy()
+    if "ATIVO" in result.columns:
+        result = result[result["ATIVO"].map(is_yes)]
+    if "ORDEM" in result.columns:
+        result["__ORDEM_NUM__"] = result["ORDEM"].map(lambda value: as_int(value, 999999))
+        result = result.sort_values(["__ORDEM_NUM__", "AREA_TRABALHO"], kind="stable")
+        result = result.drop(columns=["__ORDEM_NUM__"])
+    return result
+
+
+def cycle_structure_rows(structures: pd.DataFrame, cycle_id: str) -> pd.DataFrame:
+    if structures.empty or "CICLO_ID" not in structures.columns:
+        return structures.iloc[0:0].copy()
+    result = structures[structures["CICLO_ID"].astype(str).str.strip() == str(cycle_id).strip()].copy()
+    if "ORDEM" in result.columns:
+        result["__ORDEM_NUM__"] = result["ORDEM"].map(lambda value: as_int(value, 999999))
+        result = result.sort_values(["__ORDEM_NUM__", "AREA_TRABALHO"], kind="stable")
+        result = result.drop(columns=["__ORDEM_NUM__"])
+    return result
+
+
+def notice_is_complete(cycle: pd.Series | dict[str, Any]) -> bool:
+    required = (
+        "AVISO_VERSAO",
+        "AVISO_CONTROLADOR",
+        "AVISO_OPERADOR",
+        "AVISO_CONTATO",
+        "AVISO_RETENCAO",
+    )
+    version = str(cycle.get("AVISO_VERSAO", "")).strip()
+    return (
+        version in PARTICIPANT_NOTICE_TEMPLATES
+        and all(str(cycle.get(field, "")).strip() for field in required)
+    )
+
+
+def participant_form_ready(
+    cycle: pd.Series | dict[str, Any],
+    structures: pd.DataFrame,
+) -> bool:
+    return (
+        notice_is_complete(cycle)
+        and bool(str(cycle.get("PARTICIPANT_TOKEN", "")).strip())
+        and not structures.empty
+    )
+
+
+def make_structure_records(
+    company_id: str,
+    mappings: list[tuple[str, str]],
+    *,
+    start_order: int = 1,
+) -> list[dict[str, Any]]:
+    created_at = iso_now()
+    return [
+        {
+            "ESTRUTURA_ID": make_structure_id(company_id),
+            "EMPRESA_ID": company_id,
+            "AREA_TRABALHO": area,
+            "GRUPO_ID": make_group_id(company_id, group),
+            "GRUPO_ANALISE": group,
+            "ATIVO": "SIM",
+            "ORDEM": start_order + offset,
+            "CRIADO_EM": created_at,
+        }
+        for offset, (area, group) in enumerate(mappings)
+    ]
+
+
+def make_cycle_structure_records(
+    cycle_id: str,
+    company_id: str,
+    structures: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    created_at = iso_now()
+    return [
+        {
+            "CICLO_ID": cycle_id,
+            "EMPRESA_ID": company_id,
+            "ESTRUTURA_ID": row.get("ESTRUTURA_ID", ""),
+            "AREA_TRABALHO": row.get("AREA_TRABALHO", ""),
+            "GRUPO_ID": row.get("GRUPO_ID", ""),
+            "GRUPO_ANALISE": row.get("GRUPO_ANALISE", ""),
+            "ORDEM": row.get("ORDEM", index + 1),
+            "CRIADO_EM": created_at,
+        }
+        for index, (_, row) in enumerate(structures.iterrows())
+    ]
 
 
 # =============================================================================
@@ -420,17 +637,69 @@ def ensure_structure() -> None:
     ensure_sheet(SHEET_EMPRESAS, EMPRESAS_HEADERS)
     ensure_sheet(SHEET_CICLOS, CICLOS_HEADERS)
     ensure_sheet(SHEET_RELATORIOS, RELATORIOS_HEADERS)
+    ensure_sheet(SHEET_ESTRUTURA, ESTRUTURA_HEADERS)
+    ensure_sheet(SHEET_ESTRUTURA_CICLOS, ESTRUTURA_CICLO_HEADERS)
+    ensure_response_sheet()
     migrate_existing_companies()
 
 
-def append_row(sheet_name: str, headers: list[str], data: dict[str, Any]) -> None:
+def append_rows(sheet_name: str, headers: list[str], rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
     ensure_sheet(sheet_name, headers)
     actual_headers = get_sheet_headers(sheet_name)
     sheets = sheets_service()
-    values = [[data.get(header, "") for header in actual_headers]]
+    values = [[row.get(header, "") for header in actual_headers] for row in rows]
     sheets.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id(),
         range=f"'{sheet_name}'!A:{last_column_letter(len(actual_headers))}",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": values},
+    ).execute()
+
+
+def append_row(sheet_name: str, headers: list[str], data: dict[str, Any]) -> None:
+    append_rows(sheet_name, headers, [data])
+
+
+def ensure_response_sheet() -> list[str]:
+    """Preserva cabeçalhos do Forms e evita duplicá-los apenas por acento/formatação."""
+    sheets = sheets_service()
+    metadata = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id()).execute()
+    existing = {item["properties"]["title"] for item in metadata.get("sheets", [])}
+    if SHEET_RESPOSTAS not in existing:
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id(),
+            body={"requests": [{"addSheet": {"properties": {"title": SHEET_RESPOSTAS}}}]},
+        ).execute()
+
+    current = get_sheet_headers(SHEET_RESPOSTAS)
+    current_normalized = {normalize_header(header) for header in current}
+    merged = list(current)
+    for header in RESPOSTAS_HEADERS:
+        if normalize_header(header) not in current_normalized:
+            merged.append(header)
+            current_normalized.add(normalize_header(header))
+    if not merged:
+        merged = list(RESPOSTAS_HEADERS)
+    if merged != current:
+        sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id(),
+            range=f"'{SHEET_RESPOSTAS}'!A1:{last_column_letter(len(merged))}1",
+            valueInputOption="RAW",
+            body={"values": [merged]},
+        ).execute()
+    return merged
+
+
+def append_response(data: dict[str, Any]) -> None:
+    actual_headers = ensure_response_sheet()
+    normalized_data = {normalize_header(header): value for header, value in data.items()}
+    values = [[normalized_data.get(normalize_header(header), "") for header in actual_headers]]
+    sheets_service().spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id(),
+        range=f"'{SHEET_RESPOSTAS}'!A:{last_column_letter(len(actual_headers))}",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": values},
@@ -502,6 +771,13 @@ def find_cycle_by_token(cycles: pd.DataFrame, token: str) -> pd.Series | None:
     return matches.iloc[0] if not matches.empty else None
 
 
+def find_cycle_by_participant_token(cycles: pd.DataFrame, token: str) -> pd.Series | None:
+    if cycles.empty or "PARTICIPANT_TOKEN" not in cycles.columns:
+        return None
+    matches = cycles[cycles["PARTICIPANT_TOKEN"].astype(str) == str(token)]
+    return matches.iloc[0] if not matches.empty else None
+
+
 def find_cycle(cycles: pd.DataFrame, cycle_id: str) -> pd.Series | None:
     if cycles.empty or "CICLO_ID" not in cycles.columns:
         return None
@@ -524,7 +800,24 @@ def response_timestamp_column(df: pd.DataFrame) -> str | None:
     return None
 
 
-def filter_cycle_responses(df: pd.DataFrame, company: pd.Series, cycle: pd.Series) -> pd.DataFrame:
+def filter_notice_responses(df: pd.DataFrame, cycle: pd.Series | dict[str, Any]) -> pd.DataFrame:
+    required_version = str(cycle.get("AVISO_VERSAO", "")).strip()
+    if not required_version:
+        return df.copy()
+    if "CIENCIA_AVISO" not in df.columns or "AVISO_VERSAO" not in df.columns:
+        return df.iloc[0:0].copy()
+    accepted = df["CIENCIA_AVISO"].map(is_yes)
+    matching_version = df["AVISO_VERSAO"].astype(str).str.strip() == required_version
+    return df[accepted & matching_version].copy()
+
+
+def filter_cycle_responses(
+    df: pd.DataFrame,
+    company: pd.Series,
+    cycle: pd.Series,
+    *,
+    require_notice: bool = True,
+) -> pd.DataFrame:
     if df.empty:
         return df.copy()
     result = df.copy()
@@ -532,18 +825,41 @@ def filter_cycle_responses(df: pd.DataFrame, company: pd.Series, cycle: pd.Serie
     company_id = str(company.get("EMPRESA_ID", "")).strip()
     company_name = normalize_text(company.get("NOME", ""))
 
-    if "CICLO_ID" in result.columns and result["CICLO_ID"].astype(str).str.strip().ne("").any():
-        result = result[result["CICLO_ID"].astype(str).str.strip() == cycle_id]
-    elif "EMPRESA_ID" in result.columns and result["EMPRESA_ID"].astype(str).str.strip().ne("").any():
-        result = result[result["EMPRESA_ID"].astype(str).str.strip() == company_id]
-    elif "NOME_DA_EMPRESA" in result.columns:
-        result = result[result["NOME_DA_EMPRESA"].map(normalize_text) == company_name]
+    cycle_values = (
+        result["CICLO_ID"].astype(str).str.strip()
+        if "CICLO_ID" in result.columns
+        else pd.Series("", index=result.index, dtype="object")
+    )
+    exact_cycle = cycle_values == cycle_id
+    if exact_cycle.any():
+        result = result[exact_cycle].copy()
+        if "EMPRESA_ID" in result.columns:
+            ids = result["EMPRESA_ID"].astype(str).str.strip()
+            result = result[(ids == "") | (ids == company_id)]
     else:
-        return result.iloc[0:0].copy()
+        # Linhas antigas podem não ter IDs. Em uma planilha mista, somente linhas
+        # sem CICLO_ID participam dos fallbacks para não contaminar ciclos legados.
+        legacy = result[cycle_values == ""].copy()
+        if "EMPRESA_ID" in legacy.columns:
+            company_values = legacy["EMPRESA_ID"].astype(str).str.strip()
+            exact_company = company_values == company_id
+            if exact_company.any():
+                result = legacy[exact_company].copy()
+            else:
+                legacy = legacy[company_values == ""].copy()
+                if "NOME_DA_EMPRESA" not in legacy.columns:
+                    return legacy.iloc[0:0].copy()
+                result = legacy[legacy["NOME_DA_EMPRESA"].map(normalize_text) == company_name].copy()
+        elif "NOME_DA_EMPRESA" in legacy.columns:
+            result = legacy[legacy["NOME_DA_EMPRESA"].map(normalize_text) == company_name].copy()
+        else:
+            return legacy.iloc[0:0].copy()
 
     timestamp_col = response_timestamp_column(result)
     if timestamp_col:
-        timestamps = pd.to_datetime(result[timestamp_col], dayfirst=True, errors="coerce")
+        timestamps = result[timestamp_col].map(parse_datetime).map(
+            lambda value: value.replace(tzinfo=None) if value else pd.NaT
+        )
         start = parse_datetime(cycle.get("INICIO_EM"))
         end = parse_datetime(cycle.get("ENCERRADO_EM"))
         if start:
@@ -553,6 +869,8 @@ def filter_cycle_responses(df: pd.DataFrame, company: pd.Series, cycle: pd.Serie
         if end:
             end_naive = end.replace(tzinfo=None)
             result = result[timestamps <= end_naive]
+    if require_notice:
+        result = filter_notice_responses(result, cycle)
     return result.copy()
 
 
@@ -706,30 +1024,15 @@ def render_pix_payment(
             )
 
 
-def build_form_link(company: pd.Series, cycle: pd.Series) -> str:
-    forms_cfg = st.secrets.get("google_forms", {})
-    base_url = str(forms_cfg.get("base_url", "")).strip()
-
+def build_app_link(parameter: str, value: str) -> str:
+    base_url = str(get_app_setting("base_url", "")).strip()
     if not base_url:
-        return ""
-
+        return f"?{urlencode({parameter: value})}"
     parts = urlsplit(base_url)
     params = dict(parse_qsl(parts.query, keep_blank_values=True))
-    params["usp"] = "pp_url"
-
-    entry_company = str(forms_cfg.get("entry_company", "327839909")).strip()
-    entry_company_id = str(forms_cfg.get("entry_company_id", "")).strip()
-    entry_cycle_id = str(forms_cfg.get("entry_cycle_id", "")).strip()
-
-    if entry_company:
-        params[f"entry.{entry_company}"] = str(company.get("NOME", ""))
-
-    if entry_company_id:
-        params[f"entry.{entry_company_id}"] = str(company.get("EMPRESA_ID", ""))
-
-    if entry_cycle_id:
-        params[f"entry.{entry_cycle_id}"] = str(cycle.get("CICLO_ID", ""))
-
+    for mode_parameter in ("admin", "token", "participar"):
+        params.pop(mode_parameter, None)
+    params[parameter] = value
     return urlunsplit(
         (
             parts.scheme,
@@ -742,10 +1045,11 @@ def build_form_link(company: pd.Series, cycle: pd.Series) -> str:
 
 
 def build_client_link(token: str) -> str:
-    base_url = str(get_app_setting("base_url", "")).strip()
-    if not base_url:
-        return f"?token={token}"
-    return f"{base_url.rstrip('/')}?token={token}"
+    return build_app_link("token", token)
+
+
+def build_participant_link(token: str) -> str:
+    return build_app_link("participar", token)
 
 
 def create_zip(reports, manifest: dict[str, Any]) -> bytes:
@@ -761,7 +1065,7 @@ def create_zip(reports, manifest: dict[str, Any]) -> bytes:
 
 
 def generate_and_store_reports(company: pd.Series, cycle: pd.Series, responses: pd.DataFrame) -> tuple[bytes, str, str, list[str]]:
-    min_group = max(2, as_int(get_app_setting("min_group_size", 5), 5))
+    min_group = cycle_min_group(cycle)
     report_version = str(get_app_setting("report_version", "2.0"))
     config = ReportConfig(min_group_size=min_group, report_version=report_version)
     company_name = str(company.get("NOME", "Empresa"))
@@ -780,7 +1084,7 @@ def generate_and_store_reports(company: pd.Series, cycle: pd.Series, responses: 
         "ciclo_id": cycle.get("CICLO_ID", ""),
         "gerado_em": generated_at.isoformat(),
         "respostas": len(responses),
-        "setores_suprimidos_por_confidencialidade": suppressed,
+        "grupos_suprimidos_por_confidencialidade": len(suppressed),
         "versao": report_version,
         "arquivos": [report.filename for report in reports],
         "observacao": "Pacote definitivo do ciclo. Re-download permitido; recálculo exige reabertura administrativa.",
@@ -808,6 +1112,172 @@ def generate_and_store_reports(company: pd.Series, cycle: pd.Series, responses: 
             },
         )
     return zip_content, file_id, filename, suppressed
+
+
+# =============================================================================
+# INTERFACE: PARTICIPANTE
+# =============================================================================
+
+def render_participant_notice(company: pd.Series, cycle: pd.Series) -> None:
+    min_group = cycle_min_group(cycle)
+    version = str(cycle.get("AVISO_VERSAO", "")).strip()
+    template = PARTICIPANT_NOTICE_TEMPLATES.get(version)
+    if template is None:
+        raise ValueError(f"Versão do aviso não suportada: {version or 'ausente'}")
+    st.subheader("Aviso aos participantes")
+    st.markdown(template.format(min_group=min_group))
+    st.markdown(
+        f"""
+- **Controlador dos dados:** {cycle.get('AVISO_CONTROLADOR', company.get('NOME', ''))}
+- **Operador/prestador do serviço:** {cycle.get('AVISO_OPERADOR', '')}
+- **Contato para dúvidas e direitos dos titulares:** {cycle.get('AVISO_CONTATO', '')}
+- **Prazo e critério de retenção:** {cycle.get('AVISO_RETENCAO', '')}
+"""
+    )
+    st.caption(f"Versão do aviso: {version}")
+
+
+def render_participant() -> None:
+    st.title("📋 Pesquisa sobre condições psicossociais do trabalho")
+    token = get_query_value("participar").strip()
+    if not token:
+        st.error("Link de participação ausente ou inválido.")
+        st.stop()
+
+    companies = read_sheet(SHEET_EMPRESAS)
+    cycles = read_sheet(SHEET_CICLOS)
+    cycle = find_cycle_by_participant_token(cycles, token)
+    if cycle is None:
+        st.error("Link de participação inválido ou revogado.")
+        st.stop()
+    company = find_company(companies, str(cycle.get("EMPRESA_ID", "")))
+    if company is None or not is_yes(company.get("ATIVO", "SIM")):
+        st.error("Esta pesquisa não está disponível.")
+        st.stop()
+    if safe_status(cycle.get("STATUS")) != "COLETA":
+        st.info("A coleta desta pesquisa não está aberta.")
+        st.stop()
+    if cycle_expired(cycle):
+        st.info("O prazo para participar desta pesquisa terminou.")
+        st.stop()
+    if not notice_is_complete(cycle):
+        st.error("O aviso desta pesquisa ainda não foi finalizado. Avise o responsável pela organização.")
+        st.stop()
+
+    structures_all = read_sheet(SHEET_ESTRUTURA_CICLOS)
+    structures = cycle_structure_rows(structures_all, str(cycle.get("CICLO_ID", "")))
+    if structures.empty:
+        st.error("As áreas desta pesquisa ainda não foram configuradas. Avise o responsável pela organização.")
+        st.stop()
+
+    cycle_id = str(cycle.get("CICLO_ID", ""))
+    accepted_key = f"participant_notice_{cycle_id}"
+    declined_key = f"participant_declined_{cycle_id}"
+    submitted_key = f"participant_submitted_{cycle_id}"
+
+    st.caption(str(company.get("NOME", "Organização")))
+    if st.session_state.get(submitted_key):
+        st.success("Resposta enviada. Obrigado por participar.")
+        st.info("Você já pode fechar esta página.")
+        st.stop()
+    if st.session_state.get(declined_key):
+        st.info("Nenhuma resposta foi coletada. Você já pode fechar esta página.")
+        st.stop()
+
+    if not st.session_state.get(accepted_key):
+        render_participant_notice(company, cycle)
+        decision = st.radio(
+            "Depois de ler o aviso, escolha uma opção:",
+            (
+                "Li as informações e desejo participar",
+                "Não desejo participar",
+            ),
+            index=None,
+            key=f"participant_decision_{cycle_id}",
+        )
+        if st.button("Continuar", type="primary", disabled=decision is None, use_container_width=True):
+            if decision == "Li as informações e desejo participar":
+                st.session_state[accepted_key] = iso_now()
+            else:
+                st.session_state[declined_key] = True
+            st.rerun()
+        st.stop()
+
+    with st.expander("Rever o aviso aos participantes"):
+        render_participant_notice(company, cycle)
+
+    structure_options = {
+        str(row.get("ESTRUTURA_ID", "")): str(row.get("AREA_TRABALHO", ""))
+        for _, row in structures.iterrows()
+        if str(row.get("ESTRUTURA_ID", "")).strip() and str(row.get("AREA_TRABALHO", "")).strip()
+    }
+    with st.form(f"anonymous_survey_{cycle_id}"):
+        st.markdown("### Sobre o seu trabalho")
+        selected_structure_id = st.selectbox(
+            "Em qual área você trabalha?",
+            list(structure_options.keys()),
+            index=None,
+            placeholder="Selecione uma área",
+            format_func=lambda value: structure_options.get(value, value),
+            help="As opções foram definidas previamente pela organização.",
+            key=f"participant_area_{cycle_id}",
+        )
+        current_job = st.text_input(
+            "Cargo ou função atual (opcional)",
+            help="Exemplos: Vendedor, Analista de RH. Este campo não define o grupo do relatório.",
+            key=f"participant_job_{cycle_id}",
+        )
+
+        st.markdown("### Questionário")
+        st.caption("Considere sua experiência de trabalho e marque uma opção em cada item.")
+        answers: dict[int, str | None] = {}
+        factor_starts = {int(factor["itens"][0]): str(factor["nome"]) for factor in FATORES}
+        for number, question in QUESTIONARIO.items():
+            if number in factor_starts:
+                st.markdown(f"#### {factor_starts[number]}")
+            answers[number] = st.radio(
+                f"{number}. {question.capitalize()}",
+                ESCALA_ORDEM,
+                index=None,
+                horizontal=True,
+                key=f"survey_{cycle_id}_{number}",
+            )
+
+        submitted = st.form_submit_button("Enviar resposta", type="primary", use_container_width=True)
+
+    if submitted:
+        if not st.session_state.get(accepted_key):
+            st.error("Leia e confirme o aviso antes de responder.")
+            st.stop()
+        if not selected_structure_id or selected_structure_id not in structure_options:
+            st.error("Selecione a sua área de trabalho.")
+            st.stop()
+        unanswered = [number for number, answer in answers.items() if answer is None]
+        if unanswered:
+            st.error("Responda todos os itens antes de enviar. Itens pendentes: " + ", ".join(map(str, unanswered)))
+            st.stop()
+
+        selected = structures[
+            structures["ESTRUTURA_ID"].astype(str).str.strip() == str(selected_structure_id).strip()
+        ].iloc[0]
+        response: dict[str, Any] = {
+            "CARIMBO_DE_DATA_HORA": iso_now(),
+            "EMPRESA_ID": company.get("EMPRESA_ID", ""),
+            "CICLO_ID": cycle_id,
+            "NOME_DA_EMPRESA": company.get("NOME", ""),
+            "GRUPO_ID": selected.get("GRUPO_ID", ""),
+            "GRUPO_ANALISE": selected.get("GRUPO_ANALISE", ""),
+            # Compatibilidade com relatórios antigos que agrupavam pela coluna SETOR.
+            "SETOR": selected.get("GRUPO_ANALISE", ""),
+            "CARGO_ATUAL": current_job.strip(),
+            "CIENCIA_AVISO": "SIM",
+            "AVISO_VERSAO": cycle.get("AVISO_VERSAO", ""),
+            "CIENCIA_AVISO_EM": st.session_state[accepted_key],
+        }
+        response.update({QUESTIONARIO[number]: answer for number, answer in answers.items()})
+        append_response(response)
+        st.session_state[submitted_key] = True
+        st.rerun()
 
 
 # =============================================================================
@@ -856,7 +1326,7 @@ def render_client() -> None:
     status = safe_status(cycle.get("STATUS"))
     contracted, unit_price, contract_value, over_limit = contracted_value(cycle, response_count)
     valid_until = parse_date(cycle.get("VALIDO_ATE"))
-    min_group = max(2, as_int(get_app_setting("min_group_size", 5), 5))
+    min_group = cycle_min_group(cycle)
 
     st.subheader(str(company.get("NOME", "Empresa")))
     cols = st.columns(4)
@@ -891,13 +1361,18 @@ def render_client() -> None:
         )
 
     if status == "COLETA":
-        st.info("A coleta está aberta. Compartilhe somente o link do formulário com os funcionários.")
-        form_link = build_form_link(company, cycle)
-        if form_link:
-            st.code(form_link, language=None)
-            st.link_button("Abrir formulário", form_link, use_container_width=True)
+        st.info("A coleta está aberta. Compartilhe somente o link de participação abaixo com os trabalhadores.")
+        structures = cycle_structure_rows(
+            read_sheet(SHEET_ESTRUTURA_CICLOS),
+            str(cycle.get("CICLO_ID", "")),
+        )
+        if participant_form_ready(cycle, structures):
+            participant_link = build_participant_link(str(cycle.get("PARTICIPANT_TOKEN", "")))
+            st.code(participant_link, language=None)
+            st.link_button("Testar formulário anônimo", participant_link, use_container_width=True)
+            st.caption("O aviso aos participantes aparece antes das perguntas e precisa ser confirmado para prosseguir.")
         else:
-            st.warning("O link-base do Google Forms ainda não está configurado nos Secrets.")
+            st.error("O formulário anônimo ainda não foi preparado pelo administrador para este ciclo.")
 
         st.markdown("### Encerrar a coleta")
         st.warning(
@@ -931,7 +1406,7 @@ def render_client() -> None:
 
         st.success("Relatórios liberados para geração definitiva.")
         st.write(
-            "A compra inclui a visão geral da empresa e os relatórios dos setores que atingirem o mínimo de confidencialidade. "
+            "A compra inclui a visão geral da empresa e os relatórios dos grupos de análise que atingirem o mínimo de confidencialidade. "
             "Depois da geração, novas respostas não alteram esta edição."
         )
         confirmation = st.checkbox("Confirmo a geração da edição definitiva deste ciclo.")
@@ -955,8 +1430,7 @@ def render_client() -> None:
                     st.session_state[f"generated_zip_{cycle.get('CICLO_ID')}"] = content
                     if suppressed:
                         st.warning(
-                            "Alguns setores foram incluídos somente na visão geral por terem menos respostas que o mínimo de confidencialidade: "
-                            + ", ".join(suppressed)
+                            f"{len(suppressed)} grupo(s) de análise foram incluídos somente na visão geral por proteção de confidencialidade."
                         )
                     st.success("Pacote definitivo gerado. Ele poderá ser baixado novamente durante a validade do acesso.")
                     st.rerun()
@@ -1024,9 +1498,11 @@ def render_admin() -> None:
     ensure_structure()
     companies = read_sheet(SHEET_EMPRESAS)
     cycles = read_sheet(SHEET_CICLOS)
+    structures_all = read_sheet(SHEET_ESTRUTURA)
+    cycle_structures_all = read_sheet(SHEET_ESTRUTURA_CICLOS)
     responses_all = load_responses()
 
-    tabs = st.tabs(["Visão geral", "Nova empresa", "Novo ciclo", "Gerenciar ciclo"])
+    tabs = st.tabs(["Visão geral", "Nova empresa", "Estrutura", "Novo ciclo", "Gerenciar ciclo"])
 
     with tabs[0]:
         st.subheader("Ciclos")
@@ -1037,7 +1513,12 @@ def render_admin() -> None:
             for _, cycle in cycles.iterrows():
                 company = find_company(companies, str(cycle.get("EMPRESA_ID", "")))
                 company_name = str(company.get("NOME", "Empresa não encontrada")) if company is not None else "Empresa não encontrada"
-                responses = filter_cycle_responses(responses_all, company, cycle) if company is not None else pd.DataFrame()
+                raw_responses = (
+                    filter_cycle_responses(responses_all, company, cycle, require_notice=False)
+                    if company is not None
+                    else pd.DataFrame()
+                )
+                responses = filter_notice_responses(raw_responses, cycle)
                 contracted, unit_price, value, over = contracted_value(cycle, len(responses))
                 rows.append(
                     {
@@ -1046,6 +1527,7 @@ def render_admin() -> None:
                         "Ano": cycle.get("ANO", ""),
                         "Status": safe_status(cycle.get("STATUS")),
                         "Respostas": len(responses),
+                        "Ignoradas sem ciência": max(0, len(raw_responses) - len(responses)),
                         "Contratados": contracted,
                         "Excedente": max(0, len(responses) - contracted) if contracted else 0,
                         "Valor contratado": brl(value),
@@ -1062,10 +1544,22 @@ def render_admin() -> None:
             cnpj = st.text_input("CNPJ")
             responsible = st.text_input("Responsável")
             email = st.text_input("E-mail do responsável")
+            structure_text = st.text_area(
+                "Áreas e grupos de análise",
+                placeholder="Vendas | Administrativo\nRecursos Humanos | Administrativo\nProdução | Operacional",
+                help=(
+                    "Use uma linha por área no formato Área | Grupo. "
+                    "Se houver apenas um nível, informe somente o nome, por exemplo: Administrativo."
+                ),
+            )
             submitted = st.form_submit_button("Cadastrar", type="primary")
         if submitted:
-            if not name.strip():
-                st.error("Informe o nome da empresa.")
+            mappings, structure_errors = parse_structure_lines(structure_text)
+            if not name.strip() or structure_errors:
+                if not name.strip():
+                    st.error("Informe o nome da empresa.")
+                for error in structure_errors:
+                    st.error(error)
             else:
                 company_id = make_company_id(name)
                 append_row(
@@ -1081,10 +1575,134 @@ def render_admin() -> None:
                         "CRIADO_EM": iso_now(),
                     },
                 )
+                append_rows(
+                    SHEET_ESTRUTURA,
+                    ESTRUTURA_HEADERS,
+                    make_structure_records(company_id, mappings),
+                )
                 st.success(f"Empresa cadastrada: {company_id}")
                 st.rerun()
 
     with tabs[2]:
+        st.subheader("Áreas e grupos de análise")
+        st.write(
+            "A pessoa escolhe a área em que trabalha; o relatório usa o grupo de análise definido aqui. "
+            "Assim, Vendas e Recursos Humanos podem pertencer ao mesmo grupo Administrativo."
+        )
+        if companies.empty:
+            st.warning("Cadastre uma empresa primeiro.")
+        else:
+            structure_company_options = {
+                f"{row.get('NOME', '')} — {row.get('EMPRESA_ID', '')}": str(row.get("EMPRESA_ID", ""))
+                for _, row in companies.iterrows()
+            }
+            structure_company_label = st.selectbox(
+                "Empresa",
+                list(structure_company_options.keys()),
+                key="structure_company",
+            )
+            structure_company_id = structure_company_options[structure_company_label]
+            if structures_all.empty or "EMPRESA_ID" not in structures_all.columns:
+                company_structures = structures_all.iloc[0:0].copy()
+            else:
+                company_structures = structures_all[
+                    structures_all["EMPRESA_ID"].astype(str).str.strip() == structure_company_id
+                ].copy()
+
+            if company_structures.empty:
+                st.info("Nenhuma área cadastrada para esta empresa.")
+            else:
+                structure_view = pd.DataFrame(
+                    {
+                        "Área de trabalho": company_structures["AREA_TRABALHO"],
+                        "Grupo de análise": company_structures["GRUPO_ANALISE"],
+                        "Status": company_structures["ATIVO"].map(lambda value: "Ativo" if is_yes(value) else "Inativo"),
+                    }
+                )
+                st.dataframe(structure_view, use_container_width=True, hide_index=True)
+
+            with st.form("add_company_structures"):
+                new_structure_text = st.text_area(
+                    "Adicionar áreas",
+                    placeholder="Vendas | Administrativo\nRecursos Humanos | Administrativo",
+                    help="Uma linha por área. Sem o caractere |, a área e o grupo recebem o mesmo nome.",
+                )
+                add_structures = st.form_submit_button("Adicionar")
+            if add_structures:
+                mappings, structure_errors = parse_structure_lines(new_structure_text)
+                active_existing = active_company_structures(structures_all, structure_company_id)
+                active_area_groups = {
+                    normalize_text(row.get("AREA_TRABALHO", "")): normalize_text(row.get("GRUPO_ANALISE", ""))
+                    for _, row in active_existing.iterrows()
+                }
+                existing_group_names = {
+                    str(row.get("GRUPO_ID", "")).strip(): str(row.get("GRUPO_ANALISE", "")).strip()
+                    for _, row in company_structures.iterrows()
+                    if str(row.get("GRUPO_ID", "")).strip()
+                }
+                new_mappings: list[tuple[str, str]] = []
+                for area, group in mappings:
+                    area_key = normalize_text(area)
+                    group_key = normalize_text(group)
+                    if area_key in active_area_groups:
+                        if active_area_groups[area_key] != group_key:
+                            structure_errors.append(
+                                f"A área '{area}' já está ativa em outro grupo. Desative-a antes de criar um novo mapeamento."
+                            )
+                        continue
+                    group_id = make_group_id(structure_company_id, group)
+                    canonical_group = existing_group_names.get(group_id, group)
+                    new_mappings.append((area, canonical_group))
+                if structure_errors:
+                    for error in structure_errors:
+                        st.error(error)
+                elif not new_mappings:
+                    st.info("Nenhuma área nova para adicionar.")
+                else:
+                    start_order = 1
+                    if not company_structures.empty and "ORDEM" in company_structures.columns:
+                        start_order = max(company_structures["ORDEM"].map(as_int).max(), 0) + 1
+                    append_rows(
+                        SHEET_ESTRUTURA,
+                        ESTRUTURA_HEADERS,
+                        make_structure_records(
+                            structure_company_id,
+                            new_mappings,
+                            start_order=int(start_order),
+                        ),
+                    )
+                    st.success("Áreas adicionadas.")
+                    st.rerun()
+
+            if not company_structures.empty:
+                structure_actions = {
+                    f"{row.get('AREA_TRABALHO', '')} → {row.get('GRUPO_ANALISE', '')} | {row.get('ESTRUTURA_ID', '')}": index
+                    for index, (_, row) in enumerate(company_structures.iterrows())
+                }
+                action_label = st.selectbox("Alterar status", list(structure_actions.keys()))
+                action_row = company_structures.iloc[structure_actions[action_label]]
+                currently_active = is_yes(action_row.get("ATIVO", ""))
+                action_text = "Desativar para ciclos futuros" if currently_active else "Reativar para ciclos futuros"
+                if st.button(action_text):
+                    if not currently_active:
+                        active_existing = active_company_structures(structures_all, structure_company_id)
+                        conflict = active_existing[
+                            active_existing["AREA_TRABALHO"].map(normalize_text)
+                            == normalize_text(action_row.get("AREA_TRABALHO", ""))
+                        ]
+                        if not conflict.empty:
+                            st.error("Já existe um mapeamento ativo para esta área.")
+                            st.stop()
+                    update_row(
+                        SHEET_ESTRUTURA,
+                        ESTRUTURA_HEADERS,
+                        action_row,
+                        {"ATIVO": "NAO" if currently_active else "SIM"},
+                    )
+                    st.rerun()
+            st.caption("Alterações no cadastro valem apenas para ciclos criados depois delas; ciclos existentes usam uma cópia congelada.")
+
+    with tabs[3]:
         st.subheader("Criar ciclo comercial")
         if companies.empty:
             st.warning("Cadastre uma empresa primeiro.")
@@ -1094,45 +1712,129 @@ def render_admin() -> None:
                 for _, row in companies.iterrows()
                 if is_yes(row.get("ATIVO", "SIM"))
             }
+            if not company_options:
+                st.warning("Não há empresa ativa para criar um ciclo.")
+                company_options = {"Nenhuma empresa ativa": ""}
+            selected_label = st.selectbox(
+                "Empresa",
+                list(company_options.keys()),
+                key="new_cycle_company",
+            )
+            company_id = str(company_options[selected_label])
+            selected_company = find_company(companies, company_id)
+            selected_structures = active_company_structures(structures_all, company_id)
             with st.form("new_cycle"):
-                selected_label = st.selectbox("Empresa", list(company_options.keys()))
+                if selected_structures.empty:
+                    st.warning("Esta empresa ainda não possui áreas ativas. Cadastre-as na aba Estrutura.")
+                else:
+                    st.dataframe(
+                        selected_structures[["AREA_TRABALHO", "GRUPO_ANALISE"]].rename(
+                            columns={"AREA_TRABALHO": "Área", "GRUPO_ANALISE": "Grupo de análise"}
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
                 year = st.number_input("Ano/ciclo", min_value=2025, max_value=2100, value=now_sp().year, step=1)
                 contracted = st.number_input("Funcionários contratados", min_value=1, value=10, step=1)
                 unit_price = st.number_input("Preço por funcionário (R$)", min_value=0.0, value=0.0, step=1.0)
                 minimum = st.number_input("Valor mínimo da compra (R$)", min_value=0.0, value=0.0, step=10.0)
                 validity = st.number_input("Validade do acesso (dias)", min_value=1, value=90, step=1)
+                min_group = st.number_input(
+                    "Mínimo de respostas por grupo",
+                    min_value=2,
+                    value=max(2, as_int(get_app_setting("min_group_size", 5), 5)),
+                    step=1,
+                )
+                st.markdown("#### Aviso aos participantes")
+                st.caption(
+                    "Estes dados ficam congelados no ciclo e são exibidos antes do questionário. "
+                    f"Versão do texto: {PARTICIPANT_NOTICE_VERSION}."
+                )
+                notice_controller = st.text_input(
+                    "Controlador dos dados",
+                    value=str(selected_company.get("NOME", "")) if selected_company is not None else "",
+                    key=f"notice_controller_{company_id}",
+                )
+                notice_operator = st.text_input(
+                    "Operador/prestador do serviço",
+                    value=str(get_app_setting("operator_name", "")),
+                    key=f"notice_operator_{company_id}",
+                )
+                notice_contact = st.text_input(
+                    "Contato para dúvidas e direitos dos titulares",
+                    value=str(get_app_setting("privacy_contact", "")),
+                    key=f"notice_contact_{company_id}",
+                )
+                notice_retention = st.text_area(
+                    "Prazo e critério de retenção",
+                    value=str(get_app_setting("retention_policy", "")),
+                    key=f"notice_retention_{company_id}",
+                )
                 create = st.form_submit_button("Criar ciclo e credenciais", type="primary")
             if create:
-                company_id = str(company_options[selected_label])
-                cycle_id = make_cycle_id(company_id, int(year))
-                token, pin = make_access_credentials()
-                start = now_sp()
-                valid_until = (start + timedelta(days=int(validity))).date().isoformat()
-                append_row(
-                    SHEET_CICLOS,
-                    CICLOS_HEADERS,
-                    {
-                        "CICLO_ID": cycle_id,
-                        "EMPRESA_ID": company_id,
-                        "ANO": int(year),
-                        "TOKEN": token,
-                        "PIN_HASH": pin_hash(token, pin),
-                        "FUNCIONARIOS_CONTRATADOS": int(contracted),
-                        "PRECO_POR_FUNCIONARIO": float(unit_price),
-                        "VALOR_MINIMO": float(minimum),
-                        "VALIDO_ATE": valid_until,
-                        "STATUS": "COLETA",
-                        "INICIO_EM": start.replace(microsecond=0).isoformat(),
-                        "VERSAO": str(get_app_setting("report_version", "2.0")),
-                        "PAGAMENTO_OK": "NAO",
-                    },
-                )
-                st.success("Ciclo criado. Guarde o PIN; apenas o hash foi salvo.")
-                st.code(build_client_link(token), language=None)
-                st.code(pin, language=None)
-                st.warning("Envie o link e o PIN por canais separados.")
+                selected_structures = active_company_structures(structures_all, company_id)
+                missing_notice = [
+                    label
+                    for label, value in (
+                        ("controlador", notice_controller),
+                        ("operador/prestador", notice_operator),
+                        ("contato de privacidade", notice_contact),
+                        ("retenção", notice_retention),
+                    )
+                    if not str(value).strip()
+                ]
+                if selected_structures.empty:
+                    st.error("Cadastre pelo menos uma área ativa antes de criar o ciclo.")
+                elif missing_notice:
+                    st.error("Complete o aviso aos participantes: " + ", ".join(missing_notice) + ".")
+                else:
+                    cycle_id = make_cycle_id(company_id, int(year))
+                    token, pin = make_access_credentials()
+                    participant_token = make_participant_token()
+                    start = now_sp()
+                    valid_until = (start + timedelta(days=int(validity))).date().isoformat()
+                    # A cópia por ciclo impede que alterações futuras mudem as opções desta coleta.
+                    append_rows(
+                        SHEET_ESTRUTURA_CICLOS,
+                        ESTRUTURA_CICLO_HEADERS,
+                        make_cycle_structure_records(cycle_id, company_id, selected_structures),
+                    )
+                    append_row(
+                        SHEET_CICLOS,
+                        CICLOS_HEADERS,
+                        {
+                            "CICLO_ID": cycle_id,
+                            "EMPRESA_ID": company_id,
+                            "ANO": int(year),
+                            "TOKEN": token,
+                            "PARTICIPANT_TOKEN": participant_token,
+                            "PIN_HASH": pin_hash(token, pin),
+                            "FUNCIONARIOS_CONTRATADOS": int(contracted),
+                            "PRECO_POR_FUNCIONARIO": float(unit_price),
+                            "VALOR_MINIMO": float(minimum),
+                            "VALIDO_ATE": valid_until,
+                            "STATUS": "COLETA",
+                            "INICIO_EM": start.replace(microsecond=0).isoformat(),
+                            "VERSAO": str(get_app_setting("report_version", "2.0")),
+                            "PAGAMENTO_OK": "NAO",
+                            "MIN_GRUPO": int(min_group),
+                            "AVISO_VERSAO": PARTICIPANT_NOTICE_VERSION,
+                            "AVISO_CONTROLADOR": notice_controller.strip(),
+                            "AVISO_OPERADOR": notice_operator.strip(),
+                            "AVISO_CONTATO": notice_contact.strip(),
+                            "AVISO_RETENCAO": notice_retention.strip(),
+                        },
+                    )
+                    st.success("Ciclo criado. Guarde o PIN; apenas o hash foi salvo.")
+                    st.markdown("**Link do painel da empresa**")
+                    st.code(build_client_link(token), language=None)
+                    st.markdown("**PIN do painel**")
+                    st.code(pin, language=None)
+                    st.markdown("**Link anônimo para os participantes**")
+                    st.code(build_participant_link(participant_token), language=None)
+                    st.warning("Envie o link do painel e o PIN por canais separados. Aos trabalhadores, envie somente o link anônimo.")
 
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("Gerenciar ciclo")
         if cycles.empty:
             st.info("Nenhum ciclo cadastrado.")
@@ -1147,12 +1849,23 @@ def render_admin() -> None:
             cycle = find_cycle(cycles, options[selected])
             if cycle is not None:
                 company = find_company(companies, str(cycle.get("EMPRESA_ID", "")))
-                responses = filter_cycle_responses(responses_all, company, cycle) if company is not None else pd.DataFrame()
+                raw_responses = (
+                    filter_cycle_responses(responses_all, company, cycle, require_notice=False)
+                    if company is not None
+                    else pd.DataFrame()
+                )
+                responses = filter_notice_responses(raw_responses, cycle)
+                ignored_responses = max(0, len(raw_responses) - len(responses))
+                cycle_structures = cycle_structure_rows(
+                    cycle_structures_all,
+                    str(cycle.get("CICLO_ID", "")),
+                )
                 contracted, unit_price, value, over = contracted_value(cycle, len(responses))
                 st.write(
                     {
                         "empresa": company.get("NOME", "") if company is not None else "",
-                        "respostas": len(responses),
+                        "respostas_válidas": len(responses),
+                        "ignoradas_sem_ciência": ignored_responses,
                         "contratados": contracted,
                         "excedente": max(0, len(responses) - contracted) if contracted else 0,
                         "valor_contratado": brl(value),
@@ -1167,7 +1880,7 @@ def render_admin() -> None:
                     update_row(SHEET_CICLOS, CICLOS_HEADERS, cycle, {"PAGAMENTO_OK": "SIM"})
                     st.rerun()
                 if c2.button("Liberar geração", use_container_width=True):
-                    if len(responses) < max(2, as_int(get_app_setting("min_group_size", 5), 5)):
+                    if len(responses) < cycle_min_group(cycle):
                         st.error("Quantidade abaixo do mínimo de confidencialidade.")
                     elif over:
                         st.error("Ajuste o número contratado antes de liberar.")
@@ -1256,7 +1969,98 @@ def render_admin() -> None:
                         )
 
                 st.markdown("#### Acesso")
+                st.markdown("**Painel da empresa**")
                 st.code(build_client_link(str(cycle.get("TOKEN", ""))), language=None)
+                form_ready = participant_form_ready(cycle, cycle_structures)
+                if form_ready:
+                    st.markdown("**Formulário anônimo para os participantes**")
+                    st.code(build_participant_link(str(cycle.get("PARTICIPANT_TOKEN", ""))), language=None)
+                    st.caption(
+                        f"Aviso {cycle.get('AVISO_VERSAO', '')}; {len(cycle_structures)} área(s) congelada(s); "
+                        f"mínimo de {cycle_min_group(cycle)} respostas por grupo."
+                    )
+                    if st.button("Revogar e gerar novo link anônimo"):
+                        update_row(
+                            SHEET_CICLOS,
+                            CICLOS_HEADERS,
+                            cycle,
+                            {"PARTICIPANT_TOKEN": make_participant_token()},
+                        )
+                        st.success("O link anônimo anterior foi revogado.")
+                        st.rerun()
+                elif safe_status(cycle.get("STATUS")) == "COLETA" and company is not None:
+                    st.warning("Este ciclo é anterior ao formulário anônimo e ainda precisa ser preparado.")
+                    active_for_migration = active_company_structures(
+                        structures_all,
+                        str(company.get("EMPRESA_ID", "")),
+                    )
+                    migration_structures = (
+                        cycle_structures if not cycle_structures.empty else active_for_migration
+                    )
+                    with st.expander("Preparar formulário anônimo"):
+                        if not raw_responses.empty:
+                            st.error(
+                                "Este ciclo já tem respostas. Para não misturar respostas sem ciência registrada com o novo fluxo, "
+                                "crie um novo ciclo."
+                            )
+                        if migration_structures.empty:
+                            st.error("Cadastre áreas ativas na aba Estrutura antes de preparar o formulário.")
+                        with st.form(f"prepare_anonymous_{cycle.get('CICLO_ID', '')}"):
+                            migration_operator = st.text_input(
+                                "Operador/prestador do serviço",
+                                value=str(get_app_setting("operator_name", "")),
+                            )
+                            migration_contact = st.text_input(
+                                "Contato para dúvidas e direitos dos titulares",
+                                value=str(get_app_setting("privacy_contact", "")),
+                            )
+                            migration_retention = st.text_area(
+                                "Prazo e critério de retenção",
+                                value=str(get_app_setting("retention_policy", "")),
+                            )
+                            migration_min_group = st.number_input(
+                                "Mínimo de respostas por grupo",
+                                min_value=2,
+                                value=cycle_min_group(cycle),
+                                step=1,
+                            )
+                            prepare_form = st.form_submit_button(
+                                "Congelar estrutura e ativar",
+                                disabled=not raw_responses.empty or migration_structures.empty,
+                            )
+                        if prepare_form:
+                            if not all(
+                                str(value).strip()
+                                for value in (migration_operator, migration_contact, migration_retention)
+                            ):
+                                st.error("Preencha operador, contato e retenção.")
+                            else:
+                                if cycle_structures.empty:
+                                    append_rows(
+                                        SHEET_ESTRUTURA_CICLOS,
+                                        ESTRUTURA_CICLO_HEADERS,
+                                        make_cycle_structure_records(
+                                            str(cycle.get("CICLO_ID", "")),
+                                            str(company.get("EMPRESA_ID", "")),
+                                            migration_structures,
+                                        ),
+                                    )
+                                update_row(
+                                    SHEET_CICLOS,
+                                    CICLOS_HEADERS,
+                                    cycle,
+                                    {
+                                        "MIN_GRUPO": int(migration_min_group),
+                                        "PARTICIPANT_TOKEN": make_participant_token(),
+                                        "AVISO_VERSAO": PARTICIPANT_NOTICE_VERSION,
+                                        "AVISO_CONTROLADOR": str(company.get("NOME", "")).strip(),
+                                        "AVISO_OPERADOR": migration_operator.strip(),
+                                        "AVISO_CONTATO": migration_contact.strip(),
+                                        "AVISO_RETENCAO": migration_retention.strip(),
+                                    },
+                                )
+                                st.success("Formulário anônimo preparado.")
+                                st.rerun()
                 st.caption("O PIN original não pode ser recuperado. Para trocar o PIN, gere um novo abaixo.")
                 if st.button("Gerar novo PIN"):
                     new_pin = f"{secure_secrets.randbelow(1_000_000):06d}"
@@ -1295,8 +2099,11 @@ def render_admin() -> None:
 
 def main() -> None:
     try:
+        participant_mode = bool(get_query_value("participar").strip())
         admin_mode = get_query_value("admin") == "1"
-        if admin_mode:
+        if participant_mode:
+            render_participant()
+        elif admin_mode:
             render_admin()
         else:
             render_client()

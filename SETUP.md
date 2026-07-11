@@ -1,46 +1,76 @@
-# Instalação e migração
+# Instalação, configuração e operação
 
-## 1. Substitua os arquivos do projeto
+## 1. Arquivos e deploy
 
-Copie para o repositório:
+Publique o repositório com, no mínimo:
 
-- `app.py`
-- `reporting.py`
-- `requirements.txt`
-- `.gitignore`
-- `.streamlit/secrets.toml.example` apenas como referência
+- `app.py`;
+- `reporting.py`;
+- `requirements.txt`;
+- `.gitignore`.
 
-Não envie `.streamlit/secrets.toml` nem `credentials.json` ao GitHub.
+Não envie `.streamlit/secrets.toml`, credenciais OAuth, chave privada da conta de serviço ou qualquer outro segredo ao GitHub.
 
-## 2. APIs e permissões
+## 2. APIs e permissões do Google
 
-No Google Cloud do projeto da conta de serviço, habilite:
+No projeto do Google Cloud:
 
-- Google Sheets API
-- Google Drive API
+1. habilite a Google Sheets API e a Google Drive API;
+2. crie uma conta de serviço para acesso à planilha;
+3. compartilhe a planilha com o e-mail da conta de serviço, como Editor;
+4. configure credenciais OAuth com acesso ao Google Drive para armazenar e baixar os ZIPs dos relatórios.
 
-Compartilhe com o e-mail da conta de serviço, como Editor:
+A implementação atual usa a conta de serviço para o Google Sheets e OAuth de usuário para o Google Drive.
 
-- a planilha de respostas;
-- a pasta do Drive onde os ZIPs serão armazenados.
+## 3. Secrets do Streamlit
 
-O aplicativo precisa de escrita na planilha para registrar status, geração e arquivos.
+No Streamlit Community Cloud, abra **App settings → Secrets**. A estrutura mínima segue este modelo, com valores ilustrativos:
 
-## 3. Configure os Secrets no Streamlit
+```toml
+[gcp_service_account]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+client_email = "..."
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "..."
 
-No Streamlit Community Cloud, abra **App settings → Secrets** e use como base `.streamlit/secrets.toml.example`.
+[google_forms]
+spreadsheet_id = "ID_DA_PLANILHA"
 
-Parâmetros importantes:
+[google_drive_oauth]
+client_id = "..."
+client_secret = "..."
+refresh_token = "..."
+token_uri = "https://oauth2.googleapis.com/token"
 
-- `google_forms.spreadsheet_id`: ID da planilha;
-- `google_forms.base_url`: URL normal do Forms, sem valores pré-preenchidos;
-- `google_forms.entry_company`: atualmente `327839909`;
-- `drive.folder_id`: pasta do Drive;
-- `app.base_url`: URL publicada do app;
-- `app.admin_password`: senha forte para o painel administrativo;
-- `app.min_group_size`: recomendado `5`.
+[drive]
+folder_id = "ID_DA_PASTA"
 
-## 4. Inicialize as abas administrativas
+[app]
+base_url = "https://SEU-APP.streamlit.app/"
+admin_password = "SENHA_FORTE"
+min_group_size = 5
+report_version = "2.0"
+operator_name = "NOME OU RAZAO SOCIAL DO PRESTADOR"
+privacy_contact = "privacidade@exemplo.com"
+retention_policy = "PRAZO E CRITERIO DEFINIDOS EM CONTRATO"
+```
+
+Observações importantes:
+
+- `google_forms.spreadsheet_id` é o ID da planilha usada pelo aplicativo. O nome `google_forms` foi mantido somente por compatibilidade com o secret existente;
+- `google_forms.base_url`, `google_forms.entry_company`, `entry_company_id`, `entry_cycle_id` e demais IDs `entry.XXXX` não são usados e devem ser removidos;
+- `app.base_url` continua sendo usado para montar os links do painel e do formulário nativo do Streamlit; ele não é uma URL do Google Forms;
+- `app.min_group_size`, `operator_name`, `privacy_contact` e `retention_policy` fornecem valores iniciais na criação do ciclo. O administrador pode revisá-los antes de salvar;
+- `drive.folder_id` direciona os ZIPs para uma pasta específica. Sem ele, o upload ocorre na raiz acessível pelas credenciais OAuth;
+- a configuração `[pix]` é opcional e pode ser mantida se o fluxo comercial usar pagamento via Pix.
+
+## 4. Inicialização da planilha
 
 Depois do deploy, abra:
 
@@ -48,95 +78,114 @@ Depois do deploy, abra:
 https://SEU-APP.streamlit.app/?admin=1
 ```
 
-Ao entrar, o aplicativo cria ou confere estas abas. Se a sua aba `Empresas` já existir, as colunas antigas são preservadas e as novas são acrescentadas; linhas com `NOME` recebem um `EMPRESA_ID` automaticamente:
+Ao autenticar, o aplicativo cria ou confere as abas administrativas:
 
-- `Empresas`
-- `Ciclos`
-- `Relatorios`
+- `Empresas`: cadastro das organizações;
+- `Ciclos`: configuração, aviso, mínimo e estado de cada coleta;
+- `Relatorios`: arquivos gerados;
+- `Estrutura`: cadastro atual de áreas e grupos de análise por empresa;
+- `EstruturaCiclos`: cópia congelada da estrutura usada em cada ciclo.
 
-A aba `Respostas` continua sendo alimentada pelo Google Forms.
+A aba `Respostas` é criada ou ampliada automaticamente na inicialização administrativa. O aplicativo preserva colunas antigas e acrescenta as colunas atuais sem duplicar cabeçalhos equivalentes.
 
-## 5. Melhore o Forms para vários ciclos
+## 5. Cadastre a empresa e sua estrutura
 
-O filtro atual aceita, nesta ordem:
+Na aba **Nova empresa**, informe os dados da organização e uma linha por área no formato:
 
-1. `CICLO_ID`;
-2. `EMPRESA_ID`;
-3. `NOME DA EMPRESA` + intervalo de datas.
-
-Para reduzir erros, crie no Forms duas perguntas de resposta curta:
-
-- `EMPRESA_ID`
-- `CICLO_ID`
-
-Use **Obter link pré-preenchido** para descobrir os números `entry.XXXX`. Depois coloque os IDs nos Secrets:
-
-```toml
-entry_company_id = "ID_DO_CAMPO_EMPRESA_ID"
-entry_cycle_id = "ID_DO_CAMPO_CICLO_ID"
+```text
+Área de trabalho | Grupo de análise
 ```
 
-O Google Forms não torna esses campos realmente ocultos ou imutáveis. A validação final continua sendo feita no app por empresa, ciclo e período.
+Exemplo:
 
-## 6. Fluxo operacional recomendado
+```text
+Vendas | Administrativo
+Recursos Humanos | Administrativo
+Financeiro | Administrativo
+Produção | Operacional
+Manutenção | Operacional
+```
 
-### Venda
+A área é a opção que o participante verá. O grupo de análise é a unidade usada para contagem, supressão por confidencialidade e relatório coletivo. Sem o caractere `|`, o mesmo texto é usado nos dois níveis.
 
-Cadastre o número de funcionários contratado e o preço unitário. A compra inclui todos os relatórios coletivos daquele ciclo.
+Use a aba **Estrutura** para acrescentar áreas ou ativar e desativar mapeamentos. Uma mesma área ativa não pode apontar para dois grupos ao mesmo tempo.
 
-### Coleta
+O campo **Cargo ou função atual** aparece no formulário como texto livre opcional. Ele serve apenas como informação complementar da resposta e não define grupos nem gera relatórios por cargo. Exemplos como “Vendedor” e “Analista de RH” continuam agrupados conforme a área selecionada e o mapeamento definido previamente.
 
-O cliente recebe:
+## 6. Crie o ciclo e congele as regras
 
-- link do painel;
-- PIN por canal separado;
-- link do Forms disponível dentro do painel.
+Na aba **Novo ciclo**:
 
-### Encerramento
+1. selecione a empresa;
+2. confira as áreas ativas e os grupos correspondentes;
+3. defina dados comerciais, validade e mínimo de respostas por grupo;
+4. complete o aviso com controlador, operador/prestador, contato de privacidade e prazo/critério de retenção;
+5. crie o ciclo e guarde o PIN exibido.
 
-O cliente clica em **Solicitar encerramento e conferência**. Esse momento congela as respostas incluídas.
+Ao criar o ciclo, o aplicativo:
 
-### Liberação
+- copia as áreas e os grupos ativos de `Estrutura` para `EstruturaCiclos`;
+- grava o mínimo em `Ciclos.MIN_GRUPO`;
+- grava a versão e os quatro campos do aviso em `Ciclos`;
+- associa a versão a um template imutável do texto do aviso;
+- gera um token privado para o painel da empresa e outro token, independente, para o link anônimo dos participantes.
 
-No administrativo:
+Esses dados ficam congelados para a coleta. Alterações posteriores em **Estrutura** valem apenas para ciclos futuros e não mudam as opções ou os agrupamentos de um ciclo já criado.
 
-1. confira respostas e limite contratado;
-2. ajuste eventual excedente;
-3. confirme pagamento;
-4. libere a geração.
+## 7. Distribua os acessos corretos
 
-### Geração
+Envie ao responsável da empresa:
 
-O cliente gera uma edição definitiva. O ZIP contém:
+- o link do painel;
+- o PIN por um canal separado.
+
+Envie aos trabalhadores somente o **link anônimo para os participantes**. Não há link de Google Forms e não é necessário criar perguntas `EMPRESA_ID`, `CICLO_ID` ou links pré-preenchidos.
+
+O link anônimo só aceita respostas enquanto o ciclo estiver em `COLETA`, dentro da validade e com aviso e estrutura completos.
+Ele não revela o token do painel da empresa e pode ser revogado e recriado em **Gerenciar ciclo**.
+
+## 8. Fluxo do participante em duas etapas
+
+Na primeira etapa, o aplicativo apresenta o aviso do ciclo, incluindo o mínimo de confidencialidade, controlador, operador, contato, retenção e versão. A pessoa deve escolher explicitamente uma das opções:
+
+- **Li as informações e desejo participar**; ou
+- **Não desejo participar**.
+
+Somente a decisão afirmativa libera a segunda etapa. Se a pessoa não desejar participar, nenhuma resposta ao questionário é coletada.
+
+Na segunda etapa, a pessoa:
+
+1. seleciona uma das áreas congeladas para o ciclo;
+2. pode informar cargo ou função atual, opcionalmente;
+3. responde todos os itens;
+4. envia a resposta.
+
+A área selecionada é convertida no grupo canônico e não é persistida na linha individual. A linha gravada em `Respostas` contém o grupo, `CIENCIA_AVISO = SIM`, `AVISO_VERSAO` e `CIENCIA_AVISO_EM`. Na apuração, apenas respostas com ciência afirmativa e versão igual à versão do aviso daquele ciclo são consideradas. Respostas antigas, incompletas ou incompatíveis ficam fora da contagem e dos relatórios.
+
+## 9. Encerramento, liberação e geração
+
+1. O cliente solicita **encerramento e conferência** no painel. Esse momento congela o horário final das respostas incluídas.
+2. No administrativo, confira respostas válidas, limite contratado e eventual excedente.
+3. Confirme o pagamento e libere a geração.
+4. O cliente gera uma edição definitiva.
+
+O ZIP contém:
 
 - visão geral da empresa;
-- um relatório para cada setor com pelo menos o mínimo configurado;
+- relatórios dos grupos elegíveis depois do limite mínimo e da supressão complementar;
 - manifesto da geração.
 
-O ZIP é salvo no Google Drive. Durante os 90 dias, o cliente pode baixar novamente sem recalcular.
+Grupos abaixo do mínimo participam apenas da visão geral e não são identificados pelo nome. Se apenas um grupo ficar abaixo do mínimo, o menor grupo elegível também é ocultado: isso impede reconstruir o resultado pequeno subtraindo os relatórios publicados da visão geral. O ZIP informa somente a quantidade suprimida, é salvo no Google Drive e pode ser baixado novamente durante a validade sem recálculo.
 
-## 7. Git
+## 10. Ciclos antigos
 
-Dentro do repositório:
+Na aba **Gerenciar ciclo**, um ciclo de coleta anterior ao formulário nativo pode ser preparado somente se ainda não tiver respostas. O processo congela a estrutura ativa, o mínimo e o aviso completo.
 
-```bash
-git checkout feature/filtro-por-token
-cp /CAMINHO/DO/PACOTE/app.py ./app.py
-cp /CAMINHO/DO/PACOTE/reporting.py ./reporting.py
-cp /CAMINHO/DO/PACOTE/requirements.txt ./requirements.txt
-cp /CAMINHO/DO/PACOTE/.gitignore ./.gitignore
+Se o ciclo antigo já tiver respostas sem ciência versionada, crie um novo ciclo. Isso evita misturar respostas antigas com o fluxo que exige aceite prévio do aviso.
 
-git status
-git add app.py reporting.py requirements.txt .gitignore
-git commit -m "Add client cycles, one-time reports and privacy controls"
-git push -u origin feature/filtro-por-token
-```
-
-No Streamlit Community Cloud, altere a branch do app para testar a feature antes de fazer merge na `main`.
-
-## 8. Limitações que permanecem
+## 11. Limitações que permanecem
 
 - O painel administrativo usa senha compartilhada. Para crescer, substitua por login Google/Microsoft e lista de e-mails autorizados.
-- O aplicativo não exclui automaticamente arquivos antigos; a política de retenção deve ser definida contratualmente.
-- O relatório é um indicador coletivo e descritivo. Questionário isolado não encerra o processo técnico de gerenciamento de riscos.
-- Relatórios individuais foram removidos do fluxo empresarial. Uma futura entrega individual deve ser feita diretamente ao trabalhador, com autenticação própria e política de privacidade específica.
+- O aplicativo não exclui automaticamente arquivos ou respostas antigos; a política informada no aviso deve ser executada por processo operacional compatível com o contrato.
+- O relatório é coletivo e descritivo. O questionário isolado não encerra o processo técnico de gerenciamento de riscos.
+- Não são entregues relatórios individuais à empresa. Uma futura entrega individual exigiria canal autenticado próprio e política de privacidade específica.
