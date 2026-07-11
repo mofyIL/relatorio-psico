@@ -1,13 +1,12 @@
-streamlit>=1.42,<2
-pandas>=2.2,<3
-numpy>=2.0,<3
-matplotlib>=3.9,<4
-python-docx>=1.1,<2
-google-api-python-client>=2.160,<3
-google-auth>=2.38,<3
-google-auth-oauthlib>=1.2,<2
-qrcode[pil]>=8.2,<9
-pytest>=8.0,<9
-
-# Backend V2 opcional/preparado
-supabase>=2.6,<3
+streamlit==1.42.0
+pandas==2.2.3
+numpy==1.26.4
+pyarrow==17.0.0
+matplotlib==3.9.2
+python-docx==1.1.2
+google-api-python-client==2.160.0
+google-auth==2.38.0
+google-auth-oauthlib==1.2.1
+qrcode[pil]==8.2
+pytest==8.4.2
+supabase==2.31.0
