@@ -11,6 +11,9 @@ Esta versão usa Supabase/Postgres como backend principal quando `backend_provid
 - Confidencialidade padrão elevada para mínimo de 7 respondentes por grupo.
 - Supabase conectado para empresas, campanhas, questionário, respostas, relatórios, alertas e auditoria.
 - Coleta própria em Streamlit por link `?respond=...`, salvando em `responses`, `response_items` e `open_answers`.
+- Aviso aos participantes em etapa separada: nenhuma pergunta aparece antes do aceite e a recusa não registra resposta.
+- Áreas predefinidas por campanha, mapeadas para grupos canônicos (por exemplo, Vendas e RH → Administrativo).
+- Campo simples `Cargo ou função atual (opcional)`, sem influência no agrupamento dos relatórios.
 - ZIP final salvo no bucket privado `reports`, com hash SHA-256 e metadados registrados.
 - Processo de devolutiva técnica com o psicólogo parceiro documentado.
 

@@ -16,7 +16,8 @@ No SQL Editor do Supabase, rode nesta ordem:
 
 1. `supabase/migrations/001_initial_schema.sql`
 2. `supabase/migrations/002_rls_policies.sql`
-3. `supabase/seed_questionnaire_v2.sql`
+3. `supabase/migrations/003_participant_notice_and_analysis_groups.sql`
+4. `supabase/seed_questionnaire_v2.sql`
 
 ## 3. Criar bucket de relatórios
 
@@ -70,8 +71,10 @@ O script consulta `questionnaires`, `domains` e `questions`, imprime somente sta
 
 - `companies`: cadastro/listagem de empresas.
 - `campaigns`: criação/listagem/alteração de ciclos, status, pagamento, validade e PIN hash.
+- `company_areas` e `campaign_sectors`: cadastro área → grupo e snapshot imutável da estrutura de cada ciclo.
 - `questionnaires`, `domains`, `questions`: leitura do questionário ativo V2.
 - `responses`, `response_items`, `open_answers`: coleta própria Streamlit.
+- `responses`: registra também grupo canônico, versão do aviso e momento do aceite; consentimento ausente nunca é tratado como verdadeiro.
 - `reports`: registro do ZIP final, SHA-256, escopo e metadados.
 - `alerts`: alertas sentinela agregados na geração do relatório.
 - `audit_logs`: eventos administrativos e de acesso.

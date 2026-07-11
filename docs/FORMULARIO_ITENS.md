@@ -7,9 +7,12 @@ Campos administrativos recomendados:
 - Nome da empresa (pré-preenchido; não usar como controle único)
 - EMPRESA_ID (pré-preenchido)
 - CICLO_ID (pré-preenchido)
-- Setor
-- Família de cargo ou função agrupada
-- Consentimento/ciência do aviso aos participantes
+- Área de trabalho predefinida pela empresa (seleção, não texto livre)
+- Grupo de análise associado à área, resolvido pelo sistema e não pelo participante
+- Cargo ou função atual (opcional; não participa do agrupamento)
+- Aceite explícito do aviso aos participantes em uma etapa anterior às perguntas
+
+Exemplo de cadastro: `Vendas | Administrativo` e `Recursos Humanos | Administrativo`. As duas áreas geram um único recorte coletivo chamado `Administrativo`.
 
 Escala dos itens fechados:
 

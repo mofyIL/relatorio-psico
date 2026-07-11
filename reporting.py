@@ -146,6 +146,9 @@ BASE_COLS = {
     "NOME_DA_EMPRESA",
     "EMPRESA_ID",
     "CICLO_ID",
+    "AREA_TRABALHO",
+    "GRUPO_ID",
+    "GRUPO_ANALISE",
     "SETOR",
     "CARGO",
     "CARGO_ATUAL",
@@ -211,6 +214,35 @@ def normalize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     result.columns = [normalize_header(c) for c in result.columns]
     return result
+
+
+def _clean_display_text(value: object) -> str:
+    """Limpa o rótulo exibido sem retirar caixa ou acentos."""
+    if value is None or pd.isna(value):
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def _group_display_labels(
+    keys: pd.Series,
+    labels: pd.Series,
+    fallback_labels: pd.Series | None = None,
+) -> dict[str, str]:
+    """Escolhe um rótulo legível e estável para cada chave canônica."""
+    fallback_labels = labels if fallback_labels is None else fallback_labels
+    display_by_key: dict[str, str] = {}
+    fallback_by_key: dict[str, str] = {}
+    for key, label, fallback in zip(keys, labels, fallback_labels):
+        if not key:
+            continue
+        fallback_by_key.setdefault(key, _clean_display_text(fallback) or key)
+        cleaned_label = _clean_display_text(label)
+        if cleaned_label:
+            display_by_key.setdefault(key, cleaned_label)
+    return {
+        key: display_by_key.get(key) or fallback
+        for key, fallback in fallback_by_key.items()
+    }
 
 
 def _find_question_column(df: pd.DataFrame, question_number: int) -> str | None:
@@ -1071,7 +1103,7 @@ def generate_company_reports(
     config: ReportConfig = ReportConfig(),
     generated_at: datetime | None = None,
 ) -> tuple[list[GeneratedReport], list[str]]:
-    """Gera um relatório geral e relatórios setoriais apenas para grupos elegíveis."""
+    """Gera o relatório geral e recortes por grupo de análise canônico."""
     if df_company.empty:
         raise ValueError("Não existem respostas para a empresa/ciclo.")
     generated_at = generated_at or datetime.now()
@@ -1079,13 +1111,43 @@ def generate_company_reports(
     reports: list[GeneratedReport] = []
     suppressed: list[str] = []
 
-    if "SETOR" in normalized.columns:
-        sector_series = normalized["SETOR"].fillna("").astype(str).str.strip()
-        counts = sector_series[sector_series != ""].value_counts()
-        eligible = sorted([sector for sector, count in counts.items() if int(count) >= config.min_group_size])
-        suppressed = sorted([sector for sector, count in counts.items() if int(count) < config.min_group_size])
+    canonical_columns = {"GRUPO_ID", "GRUPO_ANALISE"}.issubset(normalized.columns)
+    canonical_keys = (
+        normalized["GRUPO_ID"].fillna("").map(_clean_display_text)
+        if canonical_columns
+        else pd.Series("", index=normalized.index, dtype="object")
+    )
+
+    if canonical_columns and canonical_keys.ne("").any():
+        raw_ids = normalized["GRUPO_ID"].fillna("")
+        group_keys = canonical_keys
+        display_by_key = _group_display_labels(
+            group_keys,
+            normalized["GRUPO_ANALISE"].fillna(""),
+            raw_ids,
+        )
+        scope_prefix = "Grupo de análise"
+    elif "SETOR" in normalized.columns:
+        raw_sectors = normalized["SETOR"].fillna("")
+        group_keys = raw_sectors.map(normalize_text)
+        display_by_key = _group_display_labels(group_keys, raw_sectors)
+        scope_prefix = "Setor"
     else:
-        eligible = []
+        group_keys = pd.Series("", index=normalized.index, dtype="object")
+        display_by_key = {}
+        scope_prefix = "Grupo de análise"
+
+    counts = group_keys[group_keys != ""].value_counts()
+    sort_key = lambda key: (normalize_text(display_by_key.get(key, key)), key)
+    eligible = sorted(
+        [key for key, count in counts.items() if int(count) >= config.min_group_size],
+        key=sort_key,
+    )
+    suppressed_keys = sorted(
+        [key for key, count in counts.items() if int(count) < config.min_group_size],
+        key=sort_key,
+    )
+    suppressed = [display_by_key.get(key, key) for key in suppressed_keys]
 
     reports.append(
         create_collective_report(
@@ -1099,13 +1161,14 @@ def generate_company_reports(
         )
     )
 
-    for sector in eligible:
-        subset = normalized[normalized["SETOR"].astype(str).str.strip() == sector].copy()
+    for group_key in eligible:
+        subset = normalized[group_keys == group_key].copy()
+        display_label = display_by_key.get(group_key, group_key)
         reports.append(
             create_collective_report(
                 subset,
                 company=company,
-                scope=f"Setor: {sector}",
+                scope=f"{scope_prefix}: {display_label}",
                 cycle_label=cycle_label,
                 generated_at=generated_at,
                 config=config,
