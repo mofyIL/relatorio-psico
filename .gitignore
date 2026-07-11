@@ -38,3 +38,29 @@ exports/
 *.bak
 *.tmp
 dasd
+
+# Ambientes virtuais
+.venv/
+.venv-oauth/
+venv/
+
+# Segredos
+.streamlit/secrets.toml
+.env
+.env.*
+
+# Caches Python
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+
+# Backups e arquivos temporários
+*.backup*
+app.py.backup*
+reporting.py.backup*
+dasd
+
+# Relatórios gerados localmente
+reports/
+*.zip
